@@ -22,7 +22,7 @@ jobs:
       - name: Install desktop test dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y python3-gi python3-pil python3-bs4 python3-requests gir1.2-gtk-4.0 gir1.2-gstreamer-1.0 gir1.2-gst-plugins-base-1.0 python3-gst-1.0 gstreamer1.0-plugins-base ffmpeg xvfb xauth
+          sudo apt-get install -y python3-gi python3-pil python3-bs4 python3-requests gir1.2-gtk-4.0 gir1.2-gstreamer-1.0 gir1.2-gst-plugins-base-1.0 python3-gst-1.0 gstreamer1.0-plugins-base gstreamer1.0-plugins-good gstreamer1.0-plugins-bad ffmpeg xvfb xauth
       - name: Check release version
         run: |
           test "${GITHUB_REF_NAME#v}" = "$(cat VERSION)"
