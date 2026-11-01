@@ -39,7 +39,16 @@ jobs:
           mkdir -p native/prebuilt/linux-x64
           install -m 0755 work/native-build/obsbot-helper native/prebuilt/linux-x64/obsbot-helper
       - name: Test desktop application
-        run: xvfb-run -a python3 test/desktop/run_isolated.py
+        run: |
+          set +e
+          xvfb-run -a python3 test/desktop/run_isolated.py > "$RUNNER_TEMP/desktop-test.log" 2>&1
+          result=$?
+          cat "$RUNNER_TEMP/desktop-test.log"
+          if [ "$result" -ne 0 ]; then
+            details=$(tail -c 2500 "$RUNNER_TEMP/desktop-test.log" | tr '\n' ' ')
+            echo "::error title=Desktop test output::$details"
+            exit "$result"
+          fi
       - name: Build and verify Debian package
         env:
           TINY_DEB_OUTPUT_DIR: ${{ runner.temp }}/release
