@@ -29,8 +29,8 @@ jobs:
           test "$(node -p "require('./package.json').version")" = "$(cat VERSION)"
       - run: npm ci
       - run: npm audit --audit-level=low
-      - run: npm test
       - run: npm run build
+      - run: npm test
       - name: Test desktop application
         run: python3 test/desktop/run_isolated.py
       - name: Build native Linux helper
