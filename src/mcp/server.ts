@@ -1,0 +1,145 @@
+import { Server } from "@modelcontextprotocol/sdk/server/index.js";
+import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import {
+  CallToolRequestSchema,
+  ListToolsRequestSchema,
+} from "@modelcontextprotocol/sdk/types.js";
+import { z } from "zod";
+import { DeviceManager } from "../device/manager.js";
+import { helperFactory } from "../device/helper-factory.js";
+import { makeLogSink } from "./log-sink.js";
+import { createTools, ToolDef } from "./tools.js";
+import { Tail2Registry } from "../tail2/registry.js";
+import { createTail2Tools } from "../tail2/tools.js";
+import { renderToolResult } from "./render.js";
+import { CaptureManager } from "../capture/manager.js";
+import { Coordinator, type RunLocal } from "../ipc/coordinator.js";
+import { buildLabel, loadBuildId } from "../ipc/build-id.js";
+import { VERSION } from "../version.js";
+
+export async function startServer(opts: { debug?: boolean } = {}): Promise<void> {
+  // Which build this process loaded. Read first and never again: a rebuild
+  // under a running process changes the stamp file but not the process, and
+  // the identity has to describe the process. See src/ipc/build-id.ts.
+  const build = loadBuildId();
+  console.error(`obsbot-mcp: build ${buildLabel(build)}`);
+
+  // helperFactory subscribes every helper it spawns to the OS bus events, so
+  // the manager hears about a camera arriving or leaving instead of finding
+  // out by failing a call. See src/device/helper-factory.ts.
+  //
+  // OBSBOT_LOG_FILE additionally mirrors the manager's diagnostics to a file:
+  // our stderr goes to a pipe the launcher owns, so a rare event like a
+  // retried arrival re-bind would otherwise be unobservable after the fact.
+  const log = makeLogSink(process.env.OBSBOT_LOG_FILE, (m) => console.error(m));
+  const mgr: DeviceManager = new DeviceManager(helperFactory(() => mgr), { log });
+
+  // DeviceManager now owns the connection lifecycle: lazy bind, invalidate +
+  // re-bind on a mid-session disconnect (self-heal), and per-camera reconnect
+  // tracking. createTools derives per-camera resolution (getTransport / reconnect
+  // / readiness gate) from the manager itself, keyed by each tool's optional
+  // `camera` selector — so nothing per-camera is wired up out here anymore.
+  const capture = new CaptureManager();
+  // --debug exposes the RE/diagnostics surface (obsbot_debug_probe tool + status raw block).
+  // Tail 2 tools are pure TypeScript (HTTP/WS — no native helper), so they ride
+  // along on every platform identically; see TAIL2-PROTOCOL.md. The registry
+  // seeds itself from OBSBOT_TAIL2_HOSTS and holds no persistent resources in
+  // this first increment (status reads are one-shot WebSockets), so there is
+  // nothing of its own to close in `shutdown`.
+  const tail2 = Tail2Registry.fromEnv(process.env);
+  const tools: ToolDef[] = [
+    ...createTools(mgr, capture, opts.debug ?? false),
+    ...createTail2Tools(tail2),
+  ];
+
+  // Single-owner camera coordination across concurrent MCP clients (see
+  // IPC-DESIGN.md). Every instance elects: the owner runs tool calls locally
+  // against the one DeviceManager; clients forward theirs to the owner and
+  // re-elect if it goes away. The owner is the newest build alive — an older
+  // owner steps down for a newer one (see
+  // docs/superpowers/specs/2026-09-27-newest-build-wins-design.md). runLocal is
+  // the bare tool dispatch; the coordinator runs it behind the single-camera
+  // lock, which covers this instance's own calls and the ones forwarded to it.
+  // A lone instance is simply the owner with no peers: it behaves exactly as
+  // before, plus an idle listener.
+  const runLocal: RunLocal = async (name, args) => {
+    const tool = tools.find((t) => t.name === name);
+    if (!tool) throw new Error(`unknown tool: ${name}`);
+    return tool.handler(args);
+  };
+  const coordinator = new Coordinator(runLocal, {
+    build,
+    // The coordinator reports its role on every change, on STDERR (never
+    // stdout — that's the JSON-RPC channel). "Which build will run my next
+    // call" is answered by the last `ipc role=` line; the harnesses match on it.
+    log: (line) => console.error(line),
+    // What stepping down for a newer build has to let go of: the same things a
+    // clean exit does, without the exit. On macOS the control open is
+    // exclusive, so the successor cannot open the camera until this is done.
+    release: async () => {
+      capture.stopAll();
+      await mgr.shutdown();
+    },
+  });
+  await coordinator.start();
+
+  // Kill any recording/preview child processes when the server exits, so nothing
+  // orphans, and drop the IPC endpoint / owner connection.
+  const shutdown = (): void => {
+    capture.stopAll();
+    void coordinator.close();
+    // The manager holds a watcher process that is deliberately never closed by
+    // any operation, so nothing else would ever stop it.
+    //
+    // Belt-and-braces, and measured to be so: with this line commented out, a
+    // real server bound to hardware and sent SIGTERM still left zero orphaned
+    // helpers, because they exit on stdin EOF when we die (helper.m:1180). The
+    // SIGINT/SIGTERM handlers also process.exit(0) immediately after this, and
+    // it is fire-and-forget, so the close() very likely does not finish.
+    //
+    // Kept anyway: it costs nothing, it is the correct thing to call, and it
+    // covers an orderly stop that does NOT tear down our stdio. Do not mistake
+    // it for what reaps the helpers — that is the pipe.
+    void mgr.shutdown();
+  };
+  process.on("exit", shutdown);
+  process.on("SIGINT", () => { shutdown(); process.exit(0); });
+  process.on("SIGTERM", () => { shutdown(); process.exit(0); });
+
+  const server = new Server(
+    // VERSION is generated from package.json — see scripts/sync-version.mjs.
+    { name: "obsbot-mcp", version: VERSION },
+    { capabilities: { tools: {} } },
+  );
+
+  server.setRequestHandler(ListToolsRequestSchema, async () => ({
+    tools: tools.map((tool) => ({
+      name: tool.name,
+      description: tool.description,
+      // Advertise a real JSON Schema (types, enums, defaults, required) derived
+      // from each tool's zod schema. Without typed properties, clients serialize
+      // numbers/booleans as strings and strict validation rejects them.
+      inputSchema: z.toJSONSchema(tool.schema, {
+        target: "draft-07",
+        io: "input",
+      }) as {
+        type: "object";
+      },
+    })),
+  }));
+
+  server.setRequestHandler(CallToolRequestSchema, async (request) => {
+    const name = request.params.name;
+    if (!tools.find((t) => t.name === name)) {
+      throw new Error(`unknown tool: ${name}`);
+    }
+    // Route through the coordinator: run locally if we own the camera, else
+    // forward to whoever does. renderToolResult runs here at the MCP boundary,
+    // on the raw tool result either way.
+    const result = await coordinator.dispatch(name, request.params.arguments ?? {});
+    return renderToolResult(result);
+  });
+
+  const stdioTransport = new StdioServerTransport();
+  await server.connect(stdioTransport);
+}

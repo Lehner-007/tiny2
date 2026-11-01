@@ -1,0 +1,57 @@
+name: Debian release
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+permissions:
+  contents: read
+
+jobs:
+  deb:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+          cache: npm
+      - name: Install desktop test dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y python3-gi gir1.2-gtk-4.0 gir1.2-gstreamer-1.0 gir1.2-gst-plugins-base-1.0 python3-gst-1.0 gstreamer1.0-plugins-base ffmpeg
+      - name: Check release version
+        run: |
+          test "${GITHUB_REF_NAME#v}" = "$(cat VERSION)"
+          test "$(node -p "require('./package.json').version")" = "$(cat VERSION)"
+      - run: npm ci
+      - run: npm audit --audit-level=low
+      - run: npm test
+      - run: npm run build
+      - name: Test desktop application
+        run: python3 test/desktop/run_isolated.py
+      - name: Build native Linux helper
+        run: |
+          sudo apt-get install -y cmake build-essential libjpeg-dev desktop-file-utils
+          cmake -S native/linux -B work/native-build -DCMAKE_BUILD_TYPE=Release
+          cmake --build work/native-build --parallel
+          mkdir -p native/prebuilt/linux-x64
+          install -m 0755 work/native-build/obsbot-helper native/prebuilt/linux-x64/obsbot-helper
+      - name: Build and verify Debian package
+        env:
+          TINY_DEB_OUTPUT_DIR: ${{ runner.temp }}/release
+        run: |
+          ./scripts/erstelledeb.sh
+          dpkg-deb --info "$TINY_DEB_OUTPUT_DIR/tiny_$(cat VERSION)_amd64.deb"
+      - name: Publish GitHub release with package and checksum
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TINY_DEB_OUTPUT_DIR: ${{ runner.temp }}/release
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            "$TINY_DEB_OUTPUT_DIR/tiny_$(cat VERSION)_amd64.deb" \
+            "$TINY_DEB_OUTPUT_DIR/tiny_$(cat VERSION)_amd64.deb.sha256" \
+            --title "Tiny $GITHUB_REF_NAME" --generate-notes

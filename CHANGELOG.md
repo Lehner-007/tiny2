@@ -1,0 +1,1133 @@
+## 0.17.0 – 01.11.2026
+
+- Debian-Veröffentlichung mit privater Node.js-22-Laufzeit, SHA-256-Prüfsumme und GitHub-Release-Workflow vorbereitet.
+
+## 0.16.9 – 01.11.2026
+
+- Tonaufnahmen verwenden standardmäßig den Musikordner statt des Bilderordners; Versionsangaben der Desktop-Dokumentation angeglichen.
+
+## 0.16.8 – 01.11.2026
+
+- Installierte Anwendung verwendet benutzerspezifische XDG-Einstellungen statt schreibgeschütztem Programmordner; portable und Quellkopien bleiben projektlokal.
+- Ersteinstellungs-Erkennung liest denselben tatsächlichen Speicherort wie die Anwendung.
+
+## 0.16.7 – 01.11.2026
+
+- Tiny-2-Positionsspeicherplätze 1–3 werden in den MCP-Eingabeschemas als Ganzzahlbereich mit Enum und Grenzen ausgewiesen; Vertragstest für alle Profilaktionen ergänzt.
+
+## 0.16.6 – 01.11.2026
+
+- „Alle Einstellungen zurücksetzen“ setzt jetzt auch Kamera-, Foto-, Video-, Audio- und Studio-Profilfelder auf ihre Startwerte zurück.
+- Versionsmetadaten von Desktop-Anwendung, Backend und Laufzeitpaket auf 0.16.6 angeglichen.
+
+## 0.16.5 – 01.11.2026
+
+- „Horizontal spiegeln“ nur noch im Menü „Kamera“ anbieten, nicht doppelt in den Programmeinstellungen.
+- Treiber-Bildregler über „Kamera → Treiber-Grundwerte wiederherstellen“ und einen Button unter „Kameraeinstellungen“ erreichbar machen.
+
+## 0.16.4 – 01.11.2026
+
+- Tonaufnahmen bei fehlgeschlagenem Abschluss erhalten; Speicherort der unvollständigen Datei anzeigen. Fehlgeschlagene Startversuche entfernen nur leere Dateien.
+- Unplausible UVC-Regler und Tiny-2-Treiberbelichtung nur lesend anzeigen; Änderungen mit nicht rückstellbarem Ausgangswert sperren. Fehler bei der Wiederherstellung melden.
+- Leere Videoencoder-Auswahl in Aufnahme-/Profilaktionen absichern.
+- Serienbilder übernehmen Bildformat und Dateiendung; separat gespeicherte JPEG-Qualität ergänzen. MP4 nutzt die Bitrate und deaktiviert den unwirksamen Qualitätsregler.
+- Desktop-Tests auf aktuelle ListBox-, Menü- und Zwei-Fenster-Bedienung anpassen; sieben gezielte Regressionstests und hardwarefreien Gesamtlauf ergänzen.
+
+## 0.16.3 – 01.11.2026
+
+- Menüeintrag „Hilfe → Info“ entfernt.
+
+## 0.16.2 – 01.11.2026
+
+- Gestenfunktionen zeigen Handzeichen und kurze Ausführungsanleitungen. Spiegelung ist als Richtungsoption derselben Zwei-Hand-Geste gekennzeichnet.
+
+## 0.16.1 – 01.11.2026
+
+- „Sprache/Gestik“ enthält die getrennten Reiter „Sprache“ und „Gestik“. Jede Funktion hat eine eigene sichtbare Zeile und einen unabhängig gespeicherten Schalter. „Ausführen“ überträgt nur die markierte Funktion.
+
+## 0.16.0 – 01.11.2026
+
+- Neuer Reiter „Sprache/Gestik“ für Sprachbefehle, Erkennungssprache und Gestenschalter. Hardwarewirkung noch zu prüfen.
+
+## 0.15.1 – 01.11.2026
+
+- Tracking-Eingaben werden bei Funktionswechsel, Sprachwechsel und Neustart gespeichert und wiederhergestellt. Kameraänderungen weiterhin über „Ausführen“.
+
+## 0.15.0 – 30.10.2026
+
+- Kamerafunktionen haben jetzt einen sichtbaren „Ausführen“-Button; Sichtfeld-Anleitung nennt das direkte Anwenden.
+- Fehlerprotokoll nennt zusätzlich den fehlgeschlagenen Kamerabefehl.
+
+## 0.14.1 – 29.10.2026
+
+- Anwendungsname in Tiny geändert: Fenster, Info, CLI, Starter, Hilfe und aktive Dokumentation. Hardwarebezeichnungen und technische MCP-Kennung bleiben kompatibel.
+
+## 0.14.0 – 29.10.2026
+
+- Anbindung eingerichteter akvcam-/v4l2loopback-Ausgabegeräte: gefiltertes Kamerabild weitergeben, Geräte/Formate erkennen, Start/Stopp und Beispielkonfiguration exportieren; keine Treiberinstallation.
+
+- Allgemeine V4L2-Kameraerkennung mit ausgelesenen Bildformaten, Auflösungen und Bildraten; Ausschluss von Metadatenknoten.
+- Erweiterte Logitech- und Treiberregler, Kameraprofile und Treiber-Grundwerte.
+- WebM, MKV, AVI und MP4 nach verfügbaren Encodern; Qualität, Bitrate, Aufnahmedauer und Fotoserien.
+- Drehung, Graustufen und Negativ auch für gespeicherte Medien; Fadenkreuz nur im Livebild; gemessene Bildrate.
+- Rückmeldungsbereich entfernt; verwendete Tiny-Kameras gehen beim Beenden nach abgeschlossener Aufnahme in den bestätigten Ruhemodus.
+- Seitenleiste für die zusätzlichen Bereiche; Ton bleibt an das Mikrofon der ausgewählten USB-Kamera gebunden.
+
+## 0.13.1 – 29.10.2026
+
+- Allgemeine USB-Kamera-Unterzeile entfernt; Hauptüberschrift zeigt die ausgewählte Kamera.
+- Kamera-Auswahl zeigt nur verständliche Modellnamen, ohne Gerätepfade oder doppelte Treiberbezeichnungen.
+
+## 0.13.0 – 29.10.2026
+
+- Livebild startet automatisch nach dem Öffnen und nach Kamerawechsel; Tiny 2 wird dabei mit Statusbestätigung aufgeweckt.
+- Kamerawechsel bei laufender Vorschau möglich; während einer Aufnahme bleibt er gesperrt.
+- Separate Mikrofon-Auswahl entfernt. Aufnahme verwendet ausschließlich ein Mikrofon desselben physischen USB-Geräts wie die gewählte Kamera.
+- Frühere gespeicherte Mikrofon-Auswahl wird nicht mehr verwendet; fehlende/stumme Kameramikrofone werden gemeldet.
+
+## 0.12.1 – 29.10.2026
+
+- Livebildstatus erst nach erstem empfangenem Bild; sichtbare Fehlermeldung bei ausbleibendem oder abgebrochenem Stream.
+- Aufwecken prüft anschließend den Wachstatus; Hintergrund-Statusabfragen sperren die Bedienaktionen nicht mehr.
+- Kamerarückmeldungen werden übersetzt dargestellt, statt englische JSON-Schlüssel und Zustandswerte anzuzeigen.
+- Erneute Hardwareprüfung über anklickbare Menüeinträge und Vergleich tatsächlich dargestellter Pixel mit Kamerabildern.
+
+## 0.12.0 – 29.10.2026
+
+- Logitech C922 Pro: Livebild, Spiegelung, PNG, Video mit Mikrofonton und Standard-V4L2-Einstellungen.
+- Unterstützte Funktionen und Wertebereiche werden vom Kameratreiber gelesen; gesperrte manuelle Werte bleiben geschützt.
+- Modellabhängige Oberfläche; Kamerawechsel bei mehreren angeschlossenen Kameras mit eindeutigem Gerätepfad.
+- C922 mit 1080p/30 und 720p/60 geprüft.
+
+## 0.11.0 – 29.10.2026
+
+- Horizontale Spiegelung für Livebild, Schnappschuss und Aufnahme; gespeicherte Auswahl und angepasste Bildkoordinatensteuerung.
+- WebM-Aufnahme mit Opus-Ton, Tiny-2-Mikrofon als bevorzugte Erstwahl, Mikrofon-Auswahl und bewusst abschaltbarer Tonspur.
+- Gemeinsame Aufnahmeuhr, gleichmäßige Video-Ausgabebildrate und kontrollierter Abschluss beider Spuren.
+- Mikrofonfehler werden gemeldet; bestehende Dateien und globale Audioeinstellungen bleiben geschützt.
+
+## 0.10.0 – 29.10.2026
+
+- Native GTK-4-Desktop-Anwendung für Tiny 2 mit Livebild, Kamerasteuerung, Presets, PNG und stiller WebM-Aufnahme.
+- DE/EN, lokale Hilfe, Einstellungen, Diagnose, Protokoll und eigener Starter.
+- Projektlokales IPC-Verzeichnis für die Desktop-Ausgabe; zentrale Version auch für Python.
+
+# Changelog
+
+## [0.9.2] — 2026-10-01
+
+### Fixed: snapshots validate JPEG integrity and retry past truncated frames
+
+The Tiny 2 sporadically emits truncated MJPEG frames — worst right after
+wake — and until now whatever the helper captured was passed through
+unvalidated, so an agent could receive a frame that decodes to half an
+image. Every snapshot is now checked at the helper RPC boundary for a
+complete SOI..EOI and retried up to 4 attempts; a persistently truncating
+camera fails with an honest error naming the remedy (`settleMs` to wait
+out the post-wake window). Validation lives in the TS layer, so all
+platform helpers get it. (Ported from obsbotd's observation — the one
+part of its critique that was both new and correct. Its other headline
+claim, atomic pan+tilt via one `VIDIOC_S_EXT_CTRLS`, turned out to be
+prior art: upstream's `v4l2_set_pantilt()` has done exactly that since
+2026-07, move-cancelling analysis included.)
+
+### Added: the 2026-10-01 probe batch — ten tools off the vendor-doc surface and the RM_TEST reads
+
+Every endpoint the census flagged as "mechanism exists, no tool" is now a
+tool, plus the two RM_TEST reads that close the loop on hybrid zoom:
+
+- **`obsbot_tail2_zoom_type`** — the auto-zoom framing patterns
+  (`normal|shot|halfBody|fullBody|P7|P9|P16|P24`); also explains the status
+  block's `zoom_type: shot` (tracking arms it). Writes GATED: requires human
+  tracking armed (500 otherwise, measured).
+- **`obsbot_tail2_preset_speed`**, **`obsbot_tail2_antiflicker`**,
+  **`obsbot_tail2_af_track`**, **`obsbot_tail2_iso_range`** (one-sided
+  writes keep the current other bound), **`obsbot_tail2_usb_mode`**,
+  **`obsbot_tail2_gesture`** (three switches + zoom factor),
+  **`obsbot_tail2_stream_config`** (encoder/resolution/bitrate + RTSP URLs
+  on the read; resolution writes GATED on output off, measured).
+- **`obsbot_tail2_export_log`** — downloads the diagnostic bundle
+  (`GET /camera/test/log`) to a file: the settings tree, runtime snapshot,
+  factory records, kernel logs.
+- **`obsbot_tail2_live_status`** — the fresh-per-request RM_TEST snapshot
+  distilled to what REST hides: live gimbal pose, zoom internals including
+  the hybrid state, runtime exposure truth, accessory telemetry.
+- All write shapes no-op-verified on live hardware (11/13 direct; the two
+  500s turned out to be the gates above, not shape errors).
+
+### Added: the 4454 key-value synthesizer — zone tracking, custom tracking, auto-zoom speed
+
+The flip-sheet census (§10b) mapped every remaining Center control to the
+UDP channel; the generic `4454` key→value writer is now synthesized and
+golden-tested against the capture:
+
+- **`obsbot_tail2_zone_tracking`** — the Console switch (key 03), send-only
+  (no readable state exists).
+- **`obsbot_tail2_auto_zoom_speed`** — 1–10 (key 0x17), send-only.
+- **`obsbot_tail2_track_custom`** — enable + per-axis Pan/Tilt 1–10 (float
+  ÷10 on the wire) + the Auto buttons (key 06/09, ONE-byte bools — semantics
+  corrected by live verification: they flip `horizontal_auto`/`vertical_auto`,
+  not the locks). Readback-verified end-to-end on hardware; locks remain
+  read-only (write path unknown — no traffic, REST guesses 404).
+- Protocol finds along the way: the identity TLV is `02 06` + SIX bytes
+  (`03 57` was never a terminator — it's the hybrid id's tail); the TLV
+  checksum constant is length-dependent `{9: 0xe1dd, 12: 0x440a}`; and REST
+  `ai/trackspeed` to `customized` requires the axis speeds in the same body.
+## [0.9.1] — 2026-10-01
+
+
+### Added: `obsbot_tail2_hybrid_zoom` — the 12x unlock, decoded off the wire
+
+The Tail 2's advertised 12x zoom is optically walled at **5.0x**: `PUT ptz/zoom`
+above 5.0 is acknowledged (HTTP 200) but silently pins at the optical ceiling.
+The unlock switch lives in OBSBOT Center's private **UDP 9999** protocol and
+nowhere in the REST tree — a full endpoint diff during a Center flip shows zero
+state changes. Decoded from differential tshark captures (flip ON vs OFF, then
+a labeled controls sweep):
+
+- **Write-frame anatomy** for the `0c 02 82 c1` zoom-family control — subcmd
+  `01` = hybrid-zoom boolean, subcmd `00` = a 1–10 speed.
+- **Both checksums cracked, full synthesis verified.** TLV value checksum
+  (21/21 samples, two command ids):
+  `byteswap16(crc16_0xA001_reflected(subcmd, value; init 0)) ^ 0xfe06`.
+  Frame checksum — the wall that forced replay for most of the session:
+  `be16(byteswap16(crc16_0xA001_reflected(first 20 bytes, field zeroed)) ^ 0xdbe4)`.
+  The coverage stops at byte 20, which is why full-frame sweeps missed it; the
+  crack came from sweeping the camera→Center direction (both directions share
+  one formula across polls, writes, and ~900-byte telemetry pushes). A frame
+  built entirely from the model — fresh random sequence, computed checksums —
+  was accepted on hardware, and the synthesizer reproduces Center's captured
+  frames byte-for-byte (pinned in tests). Only `aa29` replies (different
+  session header) remain outside the model.
+- **Replay worked first**: verbatim captured frames stayed valid for hours
+  from any source port — that fallback, the captured frames, the sender-token
+  scope question (RESOLVED: not session-bound — synthesized frames honored
+  with Center fully closed), and two slider/speed commands riding the same
+  channel are all documented in TAIL2-PROTOCOL.md §10a.
+- **Readback closed the loop**: the undocumented RM_TEST endpoints
+  (`GET /camera/test/{log,status,ust}`, §13b) serve the live runtime and
+  settings trees — the tool now verifies writes against
+  `zoom_infos.digital_enable` instead of reporting fire-and-forget, and the
+  same endpoints yield the settings schema (`ust.json`, §13) that maps every
+  Center control the REST tree hides to its persisted home.
+
+## [0.9.0] — 2026-09-30
+
+### Added: tap-to-track and tap-to-focus — point the camera at what the agent sees
+
+Two tools take a NORMALIZED frame coordinate (0.01–0.99): divide a pixel from
+`obsbot_tail2_snapshot` by the frame dimensions and pass it straight in — the geometry-free
+aiming loop, no FOV math required.
+
+- **`obsbot_tail2_track_target`** — `POST /ai/workmode/normaltrack/targetselect`, an endpoint
+  UNDOCUMENTED in the Tail 2's own REST doc (found in the Tail Air's during the SDK sweep,
+  measured live on this Tail 2 2026-09-30): a valid coordinate engages AI tracking on the
+  subject there — from mode `none` it armed `humanTrackingSingleMode` by itself. The tool reads
+  the engaged mode back. `objectTracking` cannot be entered this way (bare PUT → 400
+  `err_idx:32 "no xmin"` — it demands a bounding box whose grammar is not yet decoded).
+- **`obsbot_tail2_focus_point`** — `PUT /image/af/windowcenter`: moves the focus window AND
+  starts a point focus. afc/afs only (refused in mf, where the motor position is the tool).
+
+Hardware-verified: window moved and read back (then restored); tap-track engaged tracking
+through the built client. Tool surface: **32 `obsbot_tail2_*` tools**.
+
+### Added: the Tail 2's whole image/exposure/audio/record surface — 10 tools from the vendor's own doc
+
+The vendor REST doc (`SDKs/obsbot_tail_2_res_tful.zip`) sat unopened in `SDKs/` through the entire
+September reverse-engineering session; auditing it against the decoded surface on 2026-09-30
+turned up ~45 endpoints, most mapping exactly onto §9's "not yet decoded" list. Every endpoint
+below was then hardware-verified against firmware 7.2.13.1 before getting a tool — and the
+verification measured three firmware behaviors the doc does not mention:
+
+- **Mode-gated values read/write as HTTP 500** outside their mode: focus `motorposition` unless
+  `af/mode` is `mf`; manual `iso`/`shuttertime` unless exposure is manual; and every
+  `style/<control>` write unless `style/mode` is `manual` (a useful 500 — `"style mode is not
+  manual"`). The tools refuse these up front with guidance instead of triggering the 500.
+- **`evbias` rejects JSON integers**: `{"evbias":0}` → 400 "Invalid value type", and some
+  integer bodies ACK *without ever applying*; `0.0`/`-1.0` land. `JSON.stringify` cannot
+  produce a decimal-point float from a whole number, so the client sends this one endpoint a
+  raw body. 
+- **Manual ISO granularity is a lie**: the doc says "increment of 100"; the camera reported
+  894 — a live-AE-inherited value — on first switch to manual.
+
+New tools (tool surface now 30 `obsbot_tail2_*`): **`record`** (start/stop + state), **`capture_photo`**
+(still-photo trigger; both need storage), **`focus`** (afc/afs/mf + manual motor position 0–100),
+**`exposure`** (auto: face-priority AE + evbias; manual: ISO + shutter — mode-appropriate reads),
+**`image_adjust`** (5 controls 0–100 + style modes, values preserved across mode switches),
+**`hdr`**, **`wb`** (6 modes + Kelvin), **`stream`** (select ndi/rtsp/srt/off — the programmatic
+way to arm SRT for `obsbot_tail2_snapshot`, no OBSBOT Center needed), **`only_me`**, **`audio`**
+(volume + mute). Live-verified as a sweep: every write round-tripped readback-verified and the
+camera's original state restored afterwards (focus afc, style standard/50s, evbias 0, HDR off,
+WB auto, NDI back on).
+
+Also recorded in TAIL2-PROTOCOL.md: the full endpoint census with exercised/unexercised status,
+so the remaining vendor-documented-but-unprobed endpoints (gesture control, streaming encoder
+config, USB mode, AF window/track) have a checklist to work from.
+
+### Added: the Tail 2 can be aimed — speed moves, a pose sensor, and absolute positioning
+
+The Tail 2's HTTP API has no move-to-angle endpoint, so until now the only gimbal actions
+were recenter and preset recall. Two primitives from the vendor REST doc
+(`SDKs/obsbot_tail_2_res_tful.zip`, never opened before 2026-09-30) change that:
+
+- **`obsbot_tail2_gimbal_speed`** — the joystick primitive, `POST ptz/gimbalcontrol`:
+  per-axis speed (sign = direction, ±150 of the firmware's ±178 range), auto-stop after
+  `durationMs`. Measured: command 20 ≈ 7.9°/s, and a **positive yaw command DECREASES the
+  recorded yaw**.
+- **`obsbot_tail2_gimbal_position`** — a pose sensor the API never admits to: save the live
+  pose into an empty preset slot, read it back in degrees, delete the slot (~2 s per read).
+  Requires one empty slot — save overwrites and there is no pose-by-value write to restore a
+  clobbered preset. Leftover `pose-probe` slots from crashed reads are deleted, never trusted
+  (their stale contents would otherwise satisfy the freshness check instantly).
+- **`obsbot_tail2_gimbal_move`** — absolute positioning composed from the two above: a
+  closed loop that jogs, reads the pose, and corrects (≤5 rounds, ±1.5° tolerance), with
+  per-axis self-calibration — if a jog moves an axis *away* from its target, the assumed
+  command sign flips and the loop continues. Refuses while AI tracking is active.
+  **Hardware-verified first try 2026-09-30: a 4° move converged in one iteration, 0.9 s**,
+  preset bank left clean. The loop's stop is in a `finally`: a failed jog never leaves the
+  camera slewing.
+- **`obsbot_tail2_gimbal_invert`** — read/set control-direction inversion, readback-verified.
+
+Tool surface: 20 `obsbot_tail2_*` tools. With a move primitive and a pose read, the Tiny 2's
+aim-at-pixel geometry program becomes transferable — the preset records (pitch/yaw in
+degrees) can serve as the rotation ruler for the FOV measurement, no tape measure.
+
+## [0.8.0] — 2026-09-29
+
+### Added: OBSBOT Tail 2 support (network cameras)
+
+The server now also controls the **OBSBOT Tail 2** — the network PTZ camera — alongside the Tiny 2.
+These tools use the Tail 2's network control plane, an HTTP REST API plus a WebSocket status push,
+reverse-engineered from the camera's own web application and documented in
+[`TAIL2-PROTOCOL.md`](./TAIL2-PROTOCOL.md). Sixteen `obsbot_tail2_*` tools cover discovery
+(`devices`, `scan`, `status`, `info`), zoom (on the camera's own **1.0–12.0** ratio scale — six
+times the Tiny 2's range), gimbal recenter, AI tracking (the camera's own mode enum, including
+object tracking), tracking speed (`superLazy…crazy`, not the Tiny 2's standard/sport), **motorized
+90° portrait rotation** and **roll bias** (neither exists on the Tiny 2), the full preset
+family (`list`/`save`/`recall`/`delete`/`rename`, slots renumbered 1–3 to match the Tiny 2's
+tools), and **snapshot** — a live still frame via the camera's SRT output (ffmpeg SRT caller),
+hardware-verified end to end including a returned image. Snapshot requires SRT listener mode
+enabled in OBSBOT Center (exclusive with NDI, cleared by reboots; Center only allows changing
+streaming settings while the output is off, so a probe failing mid-configuration just means
+re-enable and retry — it serves immediately once on. On this firmware the RTSP output's enable
+flag never actually serves, measured, so SRT is the one working network output alongside NDI). The
+preset grammar — `{"operation":"set"|"call"|"delete"|"rename", "id", "name":base64}`
+on a single endpoint — was decoded from the web UI's `PresetControl` component after blind
+shape-probing failed, and every operation is hardware-verified, including recall arrival via the
+zoom readback. Two Tail 2 semantic differences the tools encode: `save` **overwrites** occupied
+slots (no create-once), and there is **no pose-by-value write** in the API at all — a slot always
+captures the live pose, so absolute positioning is aim-then-save-then-recall.
+
+Because the transport is HTTP/WS, the entire module is pure TypeScript — no native helper, no
+per-platform builds, and Windows/Linux/macOS behave identically by construction. Cameras are
+identified by MAC (as OBSBOT Center identifies them). **Discovery is an mDNS listen, not a
+sweep** — measured by capturing Center's own discovery: the camera has no query responder at
+all; it multicasts a device digest (both MACs, both IPs, the name, battery/sleep flags, as
+TXT on `_remo_mdns._tcp.local`) to 224.0.0.251:5353 every few seconds, and Center — like this
+server now — simply listens (~5 s; `SO_REUSEADDR` alongside each OS's own responder, uniform
+on all three platforms). One announcement registers the camera outright: identity, name and
+hosts, no probe. The HTTP subnet sweep (one `device_info` GET per address) remains as the
+fallback for multicast-filtered networks, and `OBSBOT_TAIL2_MDNS=0` skips the listen. Also
+fixed: `obsbot_tail2_status`, `info`, `recenter` and `preset_list` parsed the `camera`
+parameter and then dropped it, so a selector on those four tools was ignored — with two
+cameras registered they failed as "ambiguous" even when told which one to use, and an
+IP-on-first-use selector on them never registered anything. Verified against the live camera:
+listen → register → `device_info` over HTTP, discovery sending no probe at all.
+
+Two hardware behaviors shaped the client and are baked into every write:
+
+- **`{"code":200}` means acknowledged, not applied.** Measured on a live unit: a roll-bias write
+  returned success while the portrait motor was in motion and never landed. Every setter therefore
+  verifies by readback on a ladder sized for its actuator and reports `settled` — mirroring
+  `obsbot_zoom_uvc`'s contract rather than pretending acknowledgement is truth.
+- **A tool call can kill the process if WebSocket teardown races the camera's 1 Hz status push.**
+  The first live smoke crashed the server: stripping event listeners at settle left an unhandled
+  `'error'` when a teardown frame arrived after the one-shot status read had finished. The socket
+  is now terminated outright on success and stray events are no-ops; a rapid-read regression test
+  and the `scripts/e2e-tail2.mjs` teardown-race step pin it.
+
+Verified on live hardware (firmware 7.2.13.1) via `node scripts/e2e-tail2.mjs` (which, unlike the
+Tiny 2 e2e, does not move the camera — its write step is a true no-op: the camera's own reported
+zoom, written straight back) and `node scripts/e2e-tail2-presets.mjs` (save/recall/rename/delete
+round trip on the empty slot, factory preset untouched).
+
+Still open for the Tail 2 (see TAIL2-PROTOCOL.md §9): image-control writes, and the Remo
+file-transfer channel (UDP 9999 protobuf) — the session handshake is fully takeable (proven by
+replay), but file-content delivery never appears in any Center capture and forged file ops are
+dropped; PARKED. The camera's HTTP API is also unauthenticated: treat a Tail 2 on a shared LAN
+as world-writable.
+
+### Added: the newest build owns the camera endpoint
+
+After a rebuild, tool calls kept running the old code until **every** obsbot-mcp instance on the
+machine had been shut down. The server is registered at user scope, so every session spawns one,
+and the first instance to bind owned the endpoint for its lifetime — clients forward whole tool
+calls to it. A restarted session then advertises the *new* tool list while its calls execute on
+the old owner's code. Measured 2026-09-27 (macOS): a freshly built guard that stops the Tiny 2
+bind path from touching a Tail 2 was verified against the real helper, yet the next `obsbot_devices`
+opened the Tail 2 and sent it the Tiny 2 serial query — the call had been forwarded to a
+pre-rebuild instance from another project's session.
+
+Every instance now carries a **build identity** (`dist/build-info.json`: version, `builtAt`, and a
+SHA-256 digest over everything under `dist/` and `native/prebuilt/`), written on every build.
+Client and owner exchange identities on connect; the newer build takes the endpoint. The old owner
+closes a gate (calls that have not started will not start; a running call finishes and its reply is
+delivered), stops captures, shuts down helpers — on macOS the control open is exclusive, so this
+must complete before the successor can open the camera — frees the endpoint, and notifies every
+client. A call is therefore executed once, by whichever build owned the endpoint when it started.
+Clients re-elect when the connection closes rather than on their next call, so the endpoint
+settles on the newest live build with nobody making a tool call.
+
+**A client never silently runs a call on an older build.** If the owner is older and cannot step
+down — an instance from before this design — the call fails with an error naming the process to
+stop, and the next call after it exits succeeds. This applies to every tool including the
+network-only `obsbot_tail2_*` ones. First consequence for this release: the upgrade itself needs
+one last full restart, since 0.7.0-era instances cannot step down.
+
+`OBSBOT_IPC_NAME` isolates a rendezvous endpoint (tests, or a deliberate second owner); the log
+lines `ipc role=owner|client owner-build=<label>` and `build <version>/<builtAt>/<digest>` say
+which build will run your next call. Full design: `docs/superpowers/specs/2026-09-27-newest-build-wins-design.md`.
+
+Known limitations: a session keeps the tool list it started with (its calls still run the new
+code — a tool whose arguments changed may be rejected against the new schema until reconnect), a
+takeover stops recordings and previews started through the old owner (the file is closed properly,
+just shorter than asked), and only a stamped build counts as newer — a hand-copied helper or bare
+`tsc` leaves new code under an old stamp.
+
+### Fixed: a Linux aim past 130° commanded a pose the kernel silently truncates
+
+The gimbal mechanically reaches ±150° of yaw, and the limits said so on every platform — but
+uvcvideo clamps `CT_PANTILT_ABSOLUTE` writes to the range the device advertises, ±468000
+arcsec = ±130°. Measured 2026-09-01: writes of 540000 and 504000 arcsec both return success and
+land at exactly 468000. So an aim past 130° commanded a pose the kernel truncated, the
+closed-loop mover read the shortfall as the firmware fault it retries for, burned its one re-send
+on a move that could never land, and reported a miss. The yaw limit is now resolved per platform
+(130 on Linux, the mechanical 150 elsewhere); a Linux aim past 130° clamps up front and reports
+`clamped: true`. The limit bounds what may be *commanded* — reads still report poses past 130°
+truthfully, and pitch keeps a single ±90°.
+
+### Fixed: the Tiny 2 bind path never opens or writes to a Tail 2
+
+The Node candidacy table listed the Tail 2's USB PID, so on Windows (and on Linux through the
+name fallback) any camera-addressing tool could send the Tiny 2 serial query — a V3 vendor frame —
+to a USB-connected Tail 2. The enumerate/open table and the may-write table are now separate, and
+the macOS helper's uniqueID matching (which matched a Tiny 2's request to a Tail 2's path when
+locations overlapped) now requires location, vendor and product all to agree, in tested plain C.
+With a Tail 2 on the bus, the Tiny 2 bind path neither opens it nor writes to it.
+
+### Fixed: the staged helper is replaced by rename, not overwritten in place
+
+macOS caches a binary's code signature against its vnode; overwriting a staged helper that a
+running server still has mapped leaves a file the kernel kills on every launch while its hash
+still matches the build output, so it looks staged. The build now copies to a sibling and renames
+over the target, giving the new binary a fresh inode.
+
+## [0.7.0] — 2026-08-28
+
+### Added: Linux detects a live-reading kernel and closes the loop on gimbal moves
+
+Pan/tilt reads on Linux mean two different things depending on the kernel. Stock uvcvideo
+serves this camera's `CT_PANTILT_ABSOLUTE` from its cache (the firmware's `GET_INFO` stub
+strips the `AUTO_UPDATE` flag), so a read returns the last *commanded* pose. With the uvcvideo
+fix now under review on linux-media — a flags fixup for 3564:fef8, sent as
+`[PATCH 0/3] media: uvcvideo: live pan/tilt position on the OBSBOT Tiny 2` — the same read
+returns the *live* position, mid-slew or after the gimbal is moved by hand.
+
+Two things quietly depended on the cached meaning, and now behave correctly on both kernels:
+
+- **Pose composition settles first.** `obsbot_aim_at_pixel` and preset save/update compose a
+  new absolute target from the current pose. Read mid-slew, that target was short by the travel
+  remaining (five reads after a 90° pan returned 0, 18, 37, 60, 79°). They now wait for two reads
+  a beat apart to agree within one degree before composing.
+- **Moves are closed-loop.** The firmware occasionally sends one axis to a *previously*
+  commanded pose instead of the one just sent. On a stock kernel this is invisible; with live
+  reads it is detectable, so a Linux move now settles, compares against the target within one
+  step, and re-sends once.
+
+Both turn on automatically when reads are live. Detection is by **read latency**, measured in
+the native helper (new `read_latency` op): a cached read is a ~2µs memcpy, a live one is a
+~150µs+ USB `GET_CUR`, a ~70× gap with no overlap. That detects the property itself rather
+than a kernel version, so it works for the fixup, for stable/distro backports of it, and for
+any future kernel that reads live. `OBSBOT_LIVE_POSE` is tri-state: `1` forces on, `0` forces
+off, unset auto-detects. macOS and Windows honour only the override and default off. An older
+helper without the op degrades to off, never throws.
+
+`obsbot_gimbal_position` itself is unchanged — it is a report, and already promises a value
+valid during a move.
+
+### Changed: hardware verification
+
+`gimbal.move.absolute` now records where the gimbal actually was when a move times out, and
+`ai.tracking.enable` is re-tiered MANUAL: whether tracking engages depends on whether someone is
+in frame, which an automated check cannot control.
+
+## [0.6.3] — 2026-08-01
+
+### Fixed: a two-axis gimbal move could lose one of its axes (Linux)
+
+Pan and tilt are not two controls on this camera. They are one 8-byte UVC control
+(`CT_PANTILT_ABSOLUTE`) that uvcvideo *presents* as two V4L2 controls, so a write naming a
+single axis has to read-modify-write the other one. Where the driver reads that other value
+from is decided by the device's `GET_INFO` bits, and both of the available answers are wrong
+in a different situation:
+
+- Merging from the **cached setpoint** fights the camera's autonomous AI tracking: while
+  tracking has the gimbal somewhere new, a write yanks the untouched axis back to whatever the
+  host last commanded.
+- Merging from a **live `GET_CUR`** cancels user moves: the second of two writes samples the
+  first axis while it is still travelling and commits it straight back to where it started.
+
+`gimbalSet` and `gimbalRecenter` issued two parallel single-axis writes, which walks into
+whichever of those applies. Both now go out as a single `VIDIOC_S_EXT_CTRLS`: both fields are
+staged before the one commit, so whatever the read-modify-write loaded is fully overwritten
+and the merge source stops mattering. The hazard is unreachable rather than unlikely.
+
+This needs nothing from the [pending uvcvideo patch](https://lore.kernel.org/linux-media/20260725212332.64927-1-jordan.mymail@gmail.com/) —
+it is a fix on stock, unpatched kernels. Thanks to Ricardo Ribalda, who pointed out
+`VIDIOC_S_EXT_CTRLS` while reviewing that patch.
+
+Verified on hardware across four two-axis moves, including an asymmetric large-yaw/small-pitch
+case where a dropped axis is most visible, with both axes confirmed physically moving.
+
+An older helper binary that predates the new `pantilt_set` op falls back to the two-write path,
+so an install whose npm package updated without the native helper being rebuilt degrades rather
+than losing gimbal movement.
+
+### Fixed: the hardware verification that should have caught it
+
+`scripts/e2e.mjs` drove the gimbal only with vendor frames, so `gimbalSet` and `gimbalRecenter` —
+different code paths on every platform — were never exercised. The bug above would have passed
+the project's main hardware sequence with `EXIT=0`. It now runs two-axis moves through the
+transport API and prints the pose after each. Printed, not asserted: on a stock kernel that
+readback is the driver echoing what we wrote, so asserting on it would manufacture confidence
+rather than evidence.
+
+`npm run build:helper` builds the native helper *and stages it* into
+`native/prebuilt/<platform>-<arch>/`, which is the only copy the Node stack loads. Building
+without staging silently verifies the old binary — the copy on the development machine was 11
+days stale, and nothing said so.
+
+### Changed: `package.json` is the single source of truth for the version
+
+The version used to be hand-written in six places, guarded by a test that regexed each one. That
+guard could only fail *after* someone had edited five files and missed the sixth, and it had
+already failed that way: `package.json` reached 0.4.0 while all three native helpers still
+reported 0.1.0.
+
+Nothing outside `package.json` declares a version now. The helpers read it at compile time
+(CMake ≥ 3.19 parses JSON, and all three already required 3.20), `src/version.ts` is generated,
+and `server.json` is rewritten by the `npm version` hook. The helpers `#error` rather than
+defaulting when the definition is absent — a helper that silently reports a wrong version is
+worse than one that refuses to compile, because that value reaches clients over the handshake.
+
+Verifying this turned up a seventh site nobody was tracking: `package-lock.json`, pinned at
+0.4.1 while `package.json` was 0.6.2. It ships in the tarball. Corrected and now asserted.
+
+Releasing is `npm version patch`. See `RELEASING.md`.
+
+## [0.6.2] — 2026-07-26
+
+### Fixed: `npx obsbot-mcp` did nothing at all on Linux and macOS
+
+Installing from npm and running `obsbot-mcp` — exactly what the README tells you to
+configure — started a process that printed nothing and exited 0. No error, no diagnostic,
+no server. Every global install and every `npx` invocation on Linux and macOS, since the
+first commit.
+
+npm installs a `bin` entry as a **symlink** on POSIX:
+
+```
+/usr/local/bin/obsbot-mcp -> ../lib/node_modules/obsbot-mcp/dist/index.js
+```
+
+and node reports `argv[1]` as the path it was *invoked by*, not the file that path
+resolves to. `src/index.ts` gated `startServer()` on `argv[1]` matching
+`import.meta.url` as raw strings, so the guard was false for every installed copy and the
+server simply never started. Both sides are now resolved through `realpathSync` first.
+
+Windows was immune, which is why this survived: npm writes a `.cmd` shim that runs node
+against the real path, so the raw comparison held there and only there. The Linux and
+macOS ports were verified by running the built entry point directly, where `argv[1]` is
+also the real path — the bug lives specifically in the gap between the source tree and
+the *installed* tree, which nothing exercised.
+
+`test/bin-entry.test.ts` now closes that gap: it reproduces the install layout with a
+symlink to the built entry point, spawns it, and requires a real `initialize` response.
+It reports as skipped on Windows (symlinks need elevation) rather than passing without
+asserting — a green tick for a test that never ran is how this shipped in the first place.
+
+Verified in a container with no camera attached: the server comes up, reports
+`ipc role=owner`, answers `initialize`, and lists its tools. Before the fix the same
+container exited 0 in silence.
+
+## [0.6.1] — 2026-07-26
+
+### Added: published to the MCP Registry
+
+`server.json` declares the server to the [MCP Registry](https://registry.modelcontextprotocol.io)
+as `io.github.lxman/obsbot-mcp`, and the release workflow publishes it there after npm. The
+registry hosts metadata only — it points at the npm package, and proves we own that package by
+reading the new `mcpName` field back off the published tarball and comparing it to `server.json`'s
+`name`. That is why this release exists: 0.6.0 shipped without `mcpName`, so it could not be
+registered at all.
+
+Publishing upstream is worth more than the entry itself. Downstream directories ingest from the
+registry rather than taking submissions — PulseMCP pulls daily, and the VS Code/Copilot gallery
+reads registries too.
+
+Authentication is GitHub OIDC, the same trust mechanism the npm publish already uses, so there is
+no new token to rotate. It also pins the name: OIDC only authorises the `io.github.lxman/`
+namespace, and any other prefix would mean switching to DNS authentication on a domain we own.
+
+`glama.json` claims the [Glama listing](https://glama.ai/mcp/servers/xo6s3opadl), which has existed
+since Glama auto-indexed the public repo and has been showing an empty tool list.
+
+Registry metadata is immutable once published — a version can never be edited, only superseded — so
+`test/version-sync.test.ts` grew three tests. Two pin `server.json`'s *two* version fields to
+`package.json`, and one pins `server.json`'s `name` to `mcpName`, because a mismatch there surfaces
+only at publish time, on a tag, as a permissions error that does not name its own cause. The release
+workflow's tag guard now checks `server.json` directly rather than trusting that the tagged commit
+was the one CI went green on, and it waits for npm to actually serve the new version before invoking
+`mcp-publisher` — `npm publish` returns before the registry API is guaranteed to serve it, and that
+API is what the validator reads.
+
+No behaviour changes. The camera-facing surface is identical to 0.6.0.
+
+## [0.6.0] — 2026-07-26
+
+### Added: frame a region, not just a pixel
+
+**`obsbot_zoom_to_fit`** — give it a rectangle and the frame dimensions from the same
+`obsbot_capture_snapshot` result, and the camera moves *and* zooms so that rectangle fills the
+frame, with a `margin` (default 0.1) of breathing room. That brings the tool surface to 36. It
+refuses on the same terms as `obsbot_aim_at_pixel`, and validates the rectangle **before** the
+readiness gate on purpose: the gate wakes a sleeping camera, waking self-centres the gimbal, so
+checking second would let a negative-width call physically move the camera before refusing it.
+
+Verified on hardware: a 640×360 region of a 1920×1080 frame at magnification 1 returned ratio
+1.5758, magnification 2.7273, `clamped: false`, `settled: true` — matching the hand calculation
+exactly — and the region then measurably filled the frame (homography over 375 inliers, region
+occupying 0.86×0.88 of each axis against an ideal 0.909, the shortfall accounted for by the
+gimbal's whole-degree landing and the perspective of a 13° pan). `settled: true` means it:
+a snapshot taken with `settleMs: 0` the instant the call returned matched one taken 3s later at
+scale 0.99993 over 847 inliers, so the zoom ramp really had finished.
+
+**`obsbot_aim_at_pixel` now works at any zoom.** It previously refused when a continuous zoom
+was set, because the magnification was not applied. It now composes zoom into the geometry and
+aims correctly at any magnification, and the FOV modes and the zoom control are modelled as one
+magnification scale rather than two that multiply.
+
+**`obsbot_capture_snapshot` now reports `sourceFormat`** (e.g. `"MJPG 1920x1080@30.00"`) — the
+format the capture graph negotiated upstream, not the JPEG it hands back. Windows only for now;
+absent means unknown, not wrong. See the correction below for why a frame without a stated
+format cannot safely be turned into an angle.
+
+### Changed
+
+- **`obsbot_aim_at_pixel` and `obsbot_zoom_to_fit` now take a `source` declaration**
+  (`device` by default — what every caller got implicitly before). These tools turn a pixel into
+  an angle using the *camera's* optics, but they only ever receive pixels: nothing in
+  `x`/`y`/`frameWidth`/`frameHeight` reveals which feed a frame came from. A `virtual` or `ndi`
+  frame is accepted rather than refused, because a feed configured as a true pass-through aims
+  correctly — measured against an OBS→NDI chain, a dedicated output at 1080p30 matched the
+  camera's own frame to fill 1.0000 and scale 1.03 ± 0.03. But the *same* chain through OBS's
+  canvas measured 0.900 scale with a 96px offset, wrong by 11% plus a fixed bias, and the reply
+  looked identical. So a non-device declaration comes back with that assumption stated.
+
+  **This corrects the 0.5.0 notes**, which listed "the frame came from a `virtual` or `ndi`
+  source" as a refusal condition. It never was one — the tools had no `source` parameter and no
+  way to detect it. The constraint was real; the enforcement was not.
+
+- **`obsbot_capture_preview` works on the alternative feeds.** It pinned `-vcodec mjpeg` at
+  1080p60 unconditionally, which is a fact about the Tiny 2's own capture pin and nothing else:
+  OBSBOT Center's virtual camera offers nv12/yuv420p/yuyv422 and the NDI Webcam devices offer
+  UYVY only, so the pin did not merely fail to buy 60fps — ffmpeg could not open the device at
+  all ("Could not set video options") and the preview never started. `device` still pins mjpeg/60;
+  the others negotiate.
+
+- **`obsbot_status` reports `focusMode`** (`auto`|`manual`|`unknown`). `focusPosition` appears
+  **only in manual mode**: under autofocus this camera echoes the last written value rather than
+  exposing the motor — it stayed pinned across a 40° pan, a 3.34x→1x zoom and 9s of settling —
+  so publishing it would read as a live focus distance while being stale.
+
+### Fixed
+
+- **A zoom still ramping no longer silently corrupts an aim.** `obsbot_aim_at_pixel` and
+  `obsbot_zoom_to_fit` both derive magnification from a live status read. If the zoom was still
+  travelling when they read it, that magnification is one the caller's frame was never captured
+  at, and the resulting angle is wrong in proportion — up to 4x, which is degrees to tens of
+  degrees of mis-aim, returned as a clean `ok:true`. The window is wide, not a narrow race: a
+  full ratio 1.0→2.0 sweep measures ~2.4s at roughly 42 percentage points per second.
+
+  Both tools now read the status block twice, a beat apart, and **refuse** if `zoomPercent`
+  moved. Waiting would not be a fix — the frame was captured at whatever magnification the ramp
+  had reached at that instant, and settling afterwards cannot change what those pixels already
+  mean. This is the same reasoning that already makes them refuse a camera they had to wake.
+
+  Known gap, stated rather than papered over: a zoom that has been *commanded* but has not
+  started travelling yet reads steady (~140ms on hardware). That is covered for zooms this
+  server issues, but not for one started from the remote, OBSBOT Center, or AI framing.
+
+- **`obsbot_zoom_uvc` now waits for the zoom to arrive** and returns `settled`, like
+  `obsbot_zoom_to_fit` already did. Returning early is what let a caller chain zoom → aim
+  straight into the refusal above. `obsbot_zoom_vendor` is deliberately unchanged: its ratio
+  scale is a different one that "may not land exactly where asked", so a settle check against
+  the requested target would report failure on a perfectly good zoom.
+
+- **The 1080p field-of-view difference is set by frame rate, not by codec.** 0.5.0 recorded that
+  "MJPEG 1920×1080 is a 1.201× crop of YUYV 1920×1080". That comparison was MJPEG@60 against
+  YUYV@30, and it charged the codec for what the frame rate did. Measured at one pose and one
+  zoom: MJPEG@30 vs YUYV@30 came out at scale 1.00001, translation (0.2, 0.0) over 2382 inliers
+  at 0.12 px residual — the same field to within a fifth of a pixel — while MJPEG@60 is a 1.214×
+  crop of *both* (1.21422 and 1.21404).
+
+  **The user-facing warning from 0.5.0 still stands**, because `obsbot_capture_preview` pins
+  60fps: the preview really does show ~21% less than snapshots, and framing by eye in the
+  preview then aiming at a pixel from a snapshot still will not agree. Only the mechanism was
+  wrong. `obsbot_capture_snapshot` negotiates 1080p**30**, so the geometry constants — which
+  describe the 30fps field — are the right ones for the frames it returns.
+
+## [0.5.0] — 2026-07-25
+
+### Added: point the camera at what the model sees
+
+**`obsbot_aim_at_pixel`** — give it a pixel and the frame dimensions from the same
+`obsbot_capture_snapshot` result, and the camera moves so that pixel is at the centre of
+frame. It takes **no optics arguments**: it reads the camera's own FOV mode and live pose
+instead of being told them, so it cannot be aimed on a stale assumption the caller supplied.
+That brings the tool surface to 35.
+
+It refuses rather than guessing, whenever it cannot check its own assumptions: AI tracking is
+active (tracking drives the gimbal itself and would fight the aim); the camera was asleep,
+because waking moves the gimbal and invalidates the frame you measured; the frame came from a
+`virtual` or `ndi` source, which OBSBOT Center has already reframed, or is not 16:9; the FOV
+mode reads back undecodable; a continuous zoom is set, because the magnification is not applied
+yet (see *Measured* below); or the pixel lies **past vertical** from the current pose, where the
+geometry has a valid answer that would slew the camera 150° across the room.
+
+**`obsbot_status`** now also reports `fovMode` (`wide|medium|narrow|custom|unknown`) and
+`zoomPercent` (0–100), both decoded from the status block.
+
+### Changed
+
+- **`obsbot_capture_preview` now requests 1080p60**, where it previously negotiated 1080p30 —
+  the preview exists for a human to watch the gimbal move, so smooth motion is its point.
+  Pinning the codec is what makes 60 reachable, since yuyv422 caps at 30 for 1080p.
+
+  **This narrows the preview's field of view.** MJPEG 1920×1080 is a 1.201× crop of YUYV
+  1920×1080 on this camera — same resolution, different window onto the sensor (measured, 621
+  inliers, 0.46 px residual). So the preview now shows about 20% less of the room than
+  snapshots, recordings, and `obsbot_aim_at_pixel` see. Framing by eye in the preview and then
+  aiming at a pixel from a snapshot will not agree. Tracked as a known limitation below.
+
+- **`obsbot_gimbal_position` reports fractional degrees**, rounded to two decimal places, where
+  it previously returned whole numbers. This is not new precision from the hardware — the
+  device's own `GET_RES` for the pan/tilt control is 3600 arc-seconds, i.e. 1°, on every
+  platform. What it preserves is the fractional pose on Linux, where `uvcvideo` caches the
+  control and returns the setpoint this server wrote.
+
+### Measured
+
+The geometry behind aiming, all measured against a physical Tiny 2 on 2026-07-25 rather than
+taken from the vendor SDK. The method solves the camera intrinsics from **pure gimbal
+rotations** (`H = K·R·K⁻¹`): the gimbal angle is the ruler, and no distance is measured
+anywhere, which is what makes it tighter than the tape-measured method it replaces.
+
+- **Horizontal field of view: 67° wide**, from fx = 1452–1455 px across six independent
+  rotations — a 0.2% spread. Medium and narrow are **derived** from that single anchor via
+  measured per-mode magnifications of 1.15060 and 1.47073, giving 59.82° and 48.46°, rather
+  than carried as three independent figures. The ratios between modes are known ~60× better
+  than the absolutes, so three free values would let the modes drift out of proportion.
+- **Vertical tangent correction: 0.957.** The up/down asymmetry is ~1%, so a single constant
+  captures it; the principal point is effectively centred and radial distortion is negligible,
+  so neither explains it away.
+- **Zoom magnification is linear in the UVC ratio: `m = 3r − 2`**, holding to better than 0.05%,
+  so ratio 2.0 really is 4× linear. The zoom is centre-preserving to within 3 px, and it is
+  *absolute* rather than a multiplier on the FOV mode — the discrete modes and the continuous
+  zoom are two ways of writing to one scale, which is why `obsbot_zoom_uvc {ratio:1}` does not
+  reliably clear `custom`. **Measured but not yet applied**, which is why `obsbot_aim_at_pixel`
+  still refuses on a custom zoom.
+- The vendor's published **85.5° DFOV / 72.9° HFOV** pair is self-consistent only for a 4:3
+  frame (implied h/w = 0.7525), so it describes the full-sensor 4:3 mode. The SDK's
+  `FovType86/78/65` are therefore **diagonals**; converted to 4:3 horizontals they sit at a
+  constant 0.887 ± 0.003 of the measured 16:9 values — an ordinary windowed readout, not the
+  large unexplained crop that reading them as horizontal implies.
+
+### Known limitations
+
+- **The preview shows a narrower field than everything else** (above). Restoring the full field
+  means giving up the pinned MJPEG codec, and with it 60fps.
+- **The pose readout is 1° on every platform.** `GET_RES` is 3600 arc-seconds, so no platform
+  offers a finer live pose to read. `obsbot_aim_at_pixel` adds its offset to that value, which
+  costs up to a degree.
+- **Zoom hysteresis**: commanded ratio 1.75 lands 0.8% apart depending on approach direction
+  (reproducible). That is 0.09° of aim error at the frame edge — an order of magnitude below
+  what the gimbal position readback can resolve, and deliberately not corrected.
+- `obsbot_aim_at_pixel` refuses on a custom zoom, per *Measured* above.
+- **Linux gimbal position feedback is still not live**, so `obsbot_gimbal_move_speed` remains
+  unavailable there and `obsbot_aim_at_pixel` inherits the same limitation. The 0.4.1 entry below
+  said a kernel patch was being worked on; it has since been [submitted
+  upstream](https://lore.kernel.org/linux-media/20260725212332.64927-1-jordan.mymail@gmail.com/)
+  (2026-07-25, awaiting review, not merged). It marks `CT_PANTILT_ABSOLUTE` volatile so `uvcvideo`
+  queries the device on every read, and was verified on this hardware to track a live slew through
+  plain `VIDIOC_G_CTRL` while streaming. If it lands, `obsbot_gimbal_position` becomes live on Linux
+  with **no change needed in this package**.
+
+## [0.4.1] — 2026-07-21
+
+### Fixed
+
+- **Docs: the Linux gimbal-position section made claims that were not true.** It stated a kernel
+  patch "has been submitted upstream" — none was. It cited `UVC_QUIRK_OBSBOT_MIN_SETTINGS` as an
+  already-merged OBSBOT quirk setting precedent; that macro has never existed in the kernel. The
+  fix for OBSBOT's relative pan/tilt/zoom speeds did land (January 2026), but as a *general* helper
+  applying to all UVC devices, not a vendor quirk. It also attributed the stale readings to the
+  V4L2 core control framework, which `uvcvideo` does not use for these controls — the cache is
+  `uvcvideo`'s own.
+
+  The section now says a patch is being worked on, and describes the real mechanism: `uvcvideo`
+  caches the control and invalidates that cache on a UVC Control Change interrupt, which this
+  camera's firmware never sends and never advertises support for (measured: `GET_INFO` returns a
+  constant `0x03` for every Camera Terminal control, leaving the Autoupdate and Asynchronous
+  capability bits clear, contrary to UVC 1.5 §2.4.4).
+
+  No behavior change — `obsbot_gimbal_position` on Linux still reports last-commanded position, and
+  `obsbot_gimbal_move_speed` remains hidden there for the same unchanged reason. See
+  `UVCVIDEO-LINUX-POSITION-2026-07-21.md` for the full investigation.
+
+## [0.4.0] — 2026-07-21
+
+### BREAKING: every tool renamed, no aliases
+
+The entire tool surface was renamed for internal consistency (one gimbal name instead of two,
+domain-first naming, a closed bare-verb list for whole-device ops) and reorganized into eight
+subsystem domains (`device`, `gimbal`, `zoom`, `focus`, `image`, `ai`, `preset`, `capture`) plus a
+hidden `debug` domain. **There is no backward-compatible alias for any old name — every caller must
+update.** This was a deliberate one-time break: aliases would have doubled the tool count the model
+sees, working against the disambiguation problem the rename exists to fix.
+
+Four tools that mixed two distinct operating modes under one schema were also split into a pair
+each, so each new tool's parameters describe only the mode it actually needs. Net effect: the
+30-tool surface becomes 34 tools.
+
+#### Old → new name mapping
+
+Every old name below is gone; only tools listed as a rename or split target exist now. Any old
+tool not listed here kept its name unchanged (see below the table).
+
+| Old tool | New tool(s) |
+|---|---|
+| `obsbot_list_devices` | `obsbot_devices` |
+| `obsbot_set_run_status` | `obsbot_wake` **+** `obsbot_sleep` (split: state transition) |
+| `obsbot_ptz_move_angle` | `obsbot_gimbal_move` |
+| `obsbot_ptz_move_speed` | `obsbot_gimbal_move_speed` |
+| `obsbot_zoom_absolute` | `obsbot_zoom_uvc` |
+| `obsbot_zoom_speed` | `obsbot_zoom_vendor` |
+| `obsbot_focus` | `obsbot_focus_auto` **+** `obsbot_focus_manual` (split: divergent params) |
+| `obsbot_face_focus` | `obsbot_focus_face` |
+| `obsbot_ai_tracking` | `obsbot_ai_track` |
+| `obsbot_fov` | `obsbot_image_fov` |
+| `obsbot_hdr` | `obsbot_image_hdr` |
+| `obsbot_white_balance` | `obsbot_image_wb_auto` **+** `obsbot_image_wb_manual` (split) |
+| `obsbot_exposure` | `obsbot_image_exposure_auto` **+** `obsbot_image_exposure_manual` (split) |
+| `obsbot_image_control` | `obsbot_image_adjust` |
+| `obsbot_get_status` | `obsbot_status` |
+| `obsbot_snapshot` | `obsbot_capture_snapshot` |
+| `obsbot_record_start` | `obsbot_capture_record` |
+| `obsbot_preview_start` | `obsbot_capture_preview` |
+| `obsbot_probe` | `obsbot_debug_probe` (debug-gated; see below) |
+
+**Unchanged names** (already fit the new scheme, kept as-is): `obsbot_gimbal_recenter`,
+`obsbot_gimbal_position`, `obsbot_ai_track_speed`, `obsbot_preset_list`, `obsbot_preset_save`,
+`obsbot_preset_recall`, `obsbot_preset_update`, `obsbot_preset_rename`, `obsbot_preset_delete`,
+`obsbot_capture_stop`, `obsbot_capture_list`.
+
+`obsbot_debug_probe` (renamed from `obsbot_probe`) is still advertised only under `--debug` — it
+was never part of the default tool surface and stays that way in v0.4.0.
+
+
+### Fixed
+
+- Proactive re-bind after a replug now actually happens. Bus events are delivered per *process*,
+  and every process that could be listening was being closed: `promote()` clears `scanHelper`, so
+  the bound steady state is exactly one live helper — the registry's — and `handleCameraDeparted()`
+  closes it. Zero subscribers, on the departure alone; no failed call required. Earlier macOS runs
+  looked clean only because an `obsbot_devices` between unplug and replug happens to leave a
+  scan helper alive.
+
+  The fix is a long-lived `watcher` helper, spawned at `promote()` and closed by neither
+  `invalidate()` nor `discardScanHelper()` — which stays unconditional, since forking a fresh
+  scanner per attempt is load-bearing.
+
+  **The watcher must be primed, and that is not obvious.** A helper that has never enumerated
+  receives nothing. Measured on hardware across one same-port replug, three processes, none opening
+  the device: enumerated-while-present got both events, enumerated-while-absent got the arrival,
+  and never-enumerated got **neither** — while staying alive throughout and answering a later
+  `enumerate` correctly. On macOS registering the AVFoundation observers does not start delivery;
+  touching the device list does. Windows enforces the same rule for an unrelated reason, since
+  `helper.cpp` drops any event whose path is missing from the per-process `g_knownPaths`, which
+  only `enumerate` fills. So `ensureWatcher()` enumerates once, on every call — the repeat is
+  Windows insurance, since a watcher replaced during an absence can never cache the path there and
+  would otherwise stay deaf forever. macOS is measured *not* to need the repeat: one prime held
+  across two full replug cycles.
+
+  Priming failure is non-fatal — it runs after `promote()`, so throwing would escape `bind()` with
+  the camera already registered.
+
+  Verified end to end on **both platforms**, with the real `DeviceManager` and zero tool calls
+  between the unplug and the observation — a helper spawned to check the state would itself
+  enumerate, become an eligible receiver, and make the result meaningless.
+
+  Recovery behaviour now differs by platform, deliberately, and every cell is hardware-measured:
+
+  | scenario | macOS | Windows |
+  |---|---|---|
+  | same-port replug | proactive re-bind | proactive re-bind |
+  | different-port replug | proactive re-bind | recovers on the next tool call |
+  | watcher dies mid-absence | recovers proactively | recovers on the next tool call |
+
+  The Windows rows follow from the `g_knownPaths` gate, which is not a defect to be removed: it is
+  what filters the Tiny 2's `MI_02` audio interface, which registers under `KSCATEGORY_CAPTURE`
+  with an identical VID/PID and otherwise fires a phantom second camera. macOS filters on
+  `hasMediaType:AVMediaTypeVideo` and has no equivalent problem, and its re-bind is keyed to the
+  camera's **serial** rather than its path, so a changed port is invisible to it. Both Windows rows
+  degrade to the pre-fix behaviour — one extra call — rather than stranding anything.
+
+- Mid-session device-loss recovery now works on **Windows**. `DEVICE_LOST_SIGNATURES` had entries
+  for macOS and Linux but none for Windows, because the DirectShow removal code had never been
+  observed — so a camera unplugged mid-session stranded the binding until the server restarted,
+  exactly as it had on macOS before that platform was fixed. Measured on hardware (Tiny 2, cable
+  pull with the device held open): the code is `0x800701b1` = `HRESULT_FROM_WIN32(433)`
+  `ERROR_DEV_NOT_EXIST`, and **both** DirectShow surfaces — the KS/XU vendor property path and
+  `IAMCameraControl` — report it identically, so one pattern covers both. None of the plausible
+  guesses (`0x8007001F`, `0x800705B4`, `0x8007048F`, `VFW_E_NOT_CONNECTED`) was correct, which is
+  why this was observed rather than inferred.
+
+  Verified end to end across a same-port replug: the device-lost error is detected, the stale
+  binding is pruned and re-scanned within ~500 ms, and the camera re-binds automatically once it
+  returns — no restart, no manual `invalidate()`.
+
+- Linux gimbal absolute moves were landing at ~28% of the requested angle. `V4L2_CID_PAN_ABSOLUTE`/
+  `TILT_ABSOLUTE` map to the UVC `CT_PANTILT_ABSOLUTE` control, whose unit is arc-seconds per both
+  the UVC and V4L2 specs (confirmed on hardware: pan range ±468000, step 3600 — exactly ±130° at
+  3600 units/degree), but the transport divided by 1000 (mislabeled as "millidegrees"). This went
+  undetected because `gimbalSet` (write) and `camCtrlGet` (read) shared the same wrong divisor, so
+  a move-then-read check always reported 0 error while the true physical angle was ~28% of what was
+  asked for — physically confirmed after the fix: a `yaw=80` request now swings ~80°, not ~22°.
+
+  A parallel investigation explored bypassing V4L2 entirely for both reads and writes via raw USB
+  (`libusb`, with the kernel driver briefly detached) to get genuinely live position feedback — this
+  device's firmware does track live position, confirmed by a raw USB read tracking a real slew in
+  real time. That approach was reverted: detaching the kernel driver from the camera's control
+  interface, even briefly and even without writing anything, breaks any concurrent video capture on
+  this device (streaming and control share one kernel-managed USB function), which makes it
+  incompatible with actually using the camera as a webcam at the same time. `obsbot_gimbal_move` and
+  `obsbot_gimbal_recenter` are hardware-verified to work reliably via plain V4L2 writes instead — 20
+  consecutive absolute moves succeeded with a live preview running throughout. `obsbot_gimbal_move_speed`
+  is now hidden on Linux specifically: a speed×duration burst has no target position to clamp before
+  sending, and without live position feedback there's no way to bound it against the gimbal's
+  mechanical limits — `obsbot_gimbal_move`'s absolute target can be (and is) clamped up front instead.
+  See README's "Linux gimbal position feedback is not live" for the kernel-level cause (`uvcvideo`
+  doesn't mark these controls `V4L2_CTRL_FLAG_VOLATILE`) and the upstream patch submitted for it.
+
+### Added
+
+- `DeviceManager.shutdown()` closes every helper it holds — registry, scratch scanner, and watcher —
+  and is wired into the server's exit path. The watcher is the first helper deliberately built to
+  outlive every operation, so it is the first whose lifetime nothing else bounds. Note what this is
+  *not*: with the call commented out, a real server sent `SIGTERM` still left zero orphaned helpers,
+  because they exit on stdin EOF when the parent dies. The pipe is what reaps them; this is for an
+  orderly stop that does not tear down stdio.
+
+- The **Windows** helper now pushes `camera_arrived` / `camera_departed` events, so the server no
+  longer learns that the camera moved only by failing a call. Uses `CM_Register_Notification` on
+  `KSCATEGORY_CAPTURE`, whose callback runs on a thread-pool thread — no message pump and no hidden
+  window, so the helper's blocking stdin loop is unchanged. Every stdout write is now serialized
+  behind a mutex, because an event line and a response can be emitted concurrently and interleaving
+  them would corrupt both.
+
+  Departure paths are byte-identical to what `enumerate` reports, which `handleCameraDeparted()`
+  requires (it compares paths exactly and silently does nothing on a mismatch). Rather than rebuild
+  the DirectShow moniker from the notification's symbolic link — they differ in case and decoration,
+  which is precisely where a silent mismatch would come from — each `enumerate` remembers the
+  display names it produced and departures emit the remembered string.
+
+  Events are gated on a previously-enumerated path. The Tiny 2's audio interface (`MI_02`) also
+  registers under `KSCATEGORY_CAPTURE` with the same VID/PID, so an identity check alone let it fire
+  a spurious second `camera_arrived` (observed on hardware). One consequence is accepted
+  deliberately: a replug into a *different* port yields an unseen path, so no event fires and
+  recovery falls back to the failure-driven path — which still works, just on the next call rather
+  than proactively.
+
+- `obsbot_ai_track` no longer reports `verified:"hand", matched:false` on framing writes that
+  actually succeeded. `AI_MODE_TABLE` mapped the status tuple `"6,0"` to `hand` (a defensive
+  mapping taken from the Tiny4Linux reference), but on this firmware `m=6` is the transient the
+  device parks at mid-switch — `hand` is `m=3`. Because `verifyFraming()` treats anything other
+  than `unknown` as a settled landing, decoding the transient as a real framing ended the poll
+  early and reported a false negative. Confirmed on hardware by polling XU selector 6 at 60 ms
+  across a `normal -> upper-body` switch: `m=2,n=0` (before) -> `m=6,n=0` (~200 ms transient) ->
+  `m=2,n=1` (landed). The transient is ~200 ms wide and the poll interval is 200 ms, so whether it
+  was sampled was a coin flip — hence the intermittency. Verified over 10 real framing switches on
+  one camera: the old decode gave 7/10 with 3 false negatives, the fix gives 10/10.
+
+- The MCP server handshake and all three native helpers reported version `0.1.0` while the package
+  was at `0.4.0`. All four now report the real version.
+
+- A helper process that died or wedged hung the server indefinitely instead of failing. `rpcRaw()`
+  built a resolve-only promise and `HelperProcess` registered no `exit`/`error` handler, so a
+  request sent to a dead helper could never settle — the tool call simply never returned, with no
+  error and no timeout. Requests now reject when the child dies, and a per-request timeout (10s
+  default; 30s plus the caller's `settleMs` for `snapshot`) covers the other shape, a helper that
+  stays alive but stops answering — the likelier form of a driver-level fault, which no death
+  handler can catch. On timeout the queue slot is kept as a tombstone, since responses correlate by
+  position and dropping it would desync every later call.
+
+  This also restores automatic recovery. `ensureReady()` already self-heals on a thrown error
+  (`invalidate()` → re-bind → fresh helper), so a hang was silently disabling the respawn path that
+  already existed. Verified on hardware: killing the helper mid-session now recovers in ~800 ms with
+  `reconnected: true`. Recovery stays bounded — `ensureReady` self-heals exactly once per call, so a
+  permanently broken helper costs one spawn attempt per call (measured: ~60 ms, always
+  `reason: "unreachable"`) rather than looping.
+
+- `DeviceManager` no longer hands out a cached scan helper whose process has died. `invalidate()`
+  drops only registry entries, so a helper that died mid-scan — before `promote()` moved it into the
+  registry — stayed cached and every later scan talked to a dead process.
+
+- Every tool now recovers from a helper death, not just the eleven that route through the readiness
+  gate. `DeviceManager.get()` drops a bound entry whose helper has died so the next resolve re-binds.
+  Previously only `ensureReady()` called `invalidate()`, so the other ~19 call sites (`obsbot_status`,
+  `obsbot_gimbal_position`, …) returned the same dead transport indefinitely and recovery depended on
+  the caller happening to invoke a *different* tool. Since the caller is an LLM, that hidden
+  dependency meant a weaker model would retry the failing tool or report broken hardware that was
+  actually fine. A death between calls is now invisible; a death mid-request costs one error, and the
+  next call succeeds. Live bindings are untouched, so there is no per-call spawn churn.
+
+- Transport error messages are written for the model that reads them: they state what happened and
+  what to do next ("the connection resets automatically — retry this call") instead of surfacing bare
+  internals like `helper process exited (code 1, signal none)`.
+
+- A camera that enumerates and opens but cannot be identified no longer reports as no camera at all.
+  `DeviceManager.bind()` and `listCameras()` discarded every candidate failure in a bare
+  `catch { continue }`, so a device whose `readSerial()` failed produced the same
+  `no OBSBOT camera found` a caller gets with nothing plugged in, plus a `status: "busy"` entry with
+  no indication of which of two very different causes applied — another process holding the device,
+  or the vendor mailbox going quiet. Rejection reasons now aggregate into the thrown error
+  (`no OBSBOT camera found — 1 candidate(s) rejected: <path>: readSerial: no valid UG_GET_SN reply`)
+  and into an optional `reason` on each `busy` entry from `obsbot_devices`. The genuinely-empty case
+  still throws the bare message, pinned by a test. Found while debugging exactly this situation on
+  macOS hardware, where recovering the reason the code already had and threw away cost most of a
+  session.
+
+- `obsbot_debug_probe`'s `mode: "query"` polled the vendor reply mailbox with no delay between
+  attempts — the same defect `read-serial.ts` was fixed for earlier, never backported. All eight
+  attempts complete in roughly 1–2 ms, so for any command the device does not answer almost
+  immediately the loop finishes inside the reply gap and reports `no valid reply` for a command
+  that was in fact answered correctly. The impact is opcode-dependent, which is why it went
+  unnoticed: cached state such as `AI_GET_QUICK_STATUS` came back fast enough that even the
+  un-delayed loop caught it (3 of 3 attempts), while anything reading persistent storage is slower.
+  Measured on `darwin-arm64` hardware over 25 trials of `UG_GET_SN`: 24 failures (96%) without the
+  delay, 0 with it. The loop now waits 30 ms before each read, matching `read-serial.ts`.
+
+- The camera binding now survives an unplug/replug. Recovery keyed exclusively on helper *process*
+  death, but an unplug kills only the USB handle — the helper stays alive and healthy — so the
+  stale registry entry was never dropped and every later call failed indefinitely; `pkill
+  obsbot-helper` was the only way out. `HelperProcess` now flags `deviceLost` from `rpc()`, the one
+  choke point every device op crosses (which also covers tools that swallow failures into
+  `{ ok: false }` rather than throwing), and the existing prune-and-rebind path does the rest. The
+  signature list is deliberately narrow — darwin `kIOReturnNoDevice`, linux `ENODEV` — with a test
+  pinning that an ordinary error does NOT condemn a healthy binding; Windows is absent because its
+  device-removal code has not been observed and a wrong guess would drop working cameras. Two
+  further defects surfaced only on hardware: pruning had to *close* the helper rather than merely
+  forget it (dropping the reference alone leaked the process, which kept holding the device so the
+  replacement could never open it), and a failed bind has to discard the scratch helper, because
+  the macOS helper derives `path` from AVFoundation — whose view lags the USB bus and, in a
+  long-lived process, did not refresh at all, leaving a helper spawned while the camera was absent
+  reporting it with vid/pid but an empty path for over two minutes. Verified on hardware across
+  three unplug/replug cycles: recovery is unaided in ~15s, same serial, control confirmed working
+  afterwards, no leaked helpers.
+
+- `obsbot_devices` no longer reports an unplugged camera as `status: "bound"` with a serial.
+  `listCameras()` reads registry entries without re-opening them, so a stale entry was
+  indistinguishable from a healthy camera — a caller reads that as "present and ready" when the
+  camera is not attached at all.
+
+- White balance no longer ignores the temperature you ask for on macOS. Every Processing Unit
+  transfer was issued at 4 bytes while the Tiny 2 declares these controls as 2 (`GET_LEN`), and the
+  surplus bytes returned uninitialised junk in the high half that *varied between calls* — `0x0200`,
+  `0x0001` and `0x00010000` all observed — so every `GET_MIN`/`GET_MAX` carried a large, unstable
+  offset. `obsbot_image_wb_manual` clamps an absolute Kelvin value against that range, so any sane
+  temperature fell below the corrupted minimum and pinned to it: 5600K requested, 2000K delivered.
+  `obsbot_image_adjust` survived only by luck — it maps a 0–100 percentage onto `[min,max]`, so a
+  constant offset cancels in the low bytes the device actually reads, leaving just a visibly wrong
+  `value` (33554482 for "brightness 50"). Both now size their transfers from `GET_LEN`, which
+  doubles as a support check: `gain` and `backlight-compensation` report length 0 on this device and
+  are refused instead of returning success for a write that does nothing.
+
+- `obsbot_gimbal_move_speed` documents its unit and bounds its input. It was the only tool that made
+  the caller reverse-engineer the scale — every other tool takes a human unit and converts
+  internally, but this one passed yaw/pitch straight to the firmware with no clamp and a description
+  that never said speed in *what*. Measured against the live position readback, it is degrees per
+  second and linear across the band. Past the limit the firmware does not saturate, it silently
+  ignores the command: 180, 200 and 300 each produced exactly 0° of motion while still returning
+  `ok: true`. Requests are now clamped to ±150 °/s (150/160/170 all verified to drive the gimbal;
+  the true cutoff lies in 170–180) and the result echoes the speeds actually used.
+
+### Internal
+
+- Added `test/mcp/framing-seam.test.ts`, which drives raw 60-byte status blocks through the real
+  `decodeStatus` into the real `verifyFraming`. Both existing suites stayed green through the
+  framing regression above because neither crossed that seam: the codec tests asserted the
+  tuple-to-label mapping while the framing tests hand-fed the literal string `"unknown"` as the
+  transient. Each half was self-consistent; only the join was wrong.
+
+- Added `test/version-sync.test.ts`, which fails if the version declared in `src/mcp/server.ts` or
+  any of the three native helpers drifts from `package.json`. The helpers compile separately and
+  `src/` cannot import `package.json` (`rootDir: "src"`), so the string has to be duplicated — this
+  makes the duplication safe rather than silent.
+
+- The `obsbot_debug_probe` tests now model the device's *latency*, not just its wire protocol. Every
+  existing probe test used a fake that answers instantly, which is precisely why none of them caught
+  the missing poll delay above; a fake that replies only after a set interval fails against the old
+  loop and passes against the new one. A companion test pins that a device which never answers still
+  gives up rather than hanging, so the delay cannot turn a real timeout into a stall.
+
+- Added `scripts/procamp-check.mjs`, a non-destructive hardware check for the image-adjust /
+  white-balance path, alongside `e2e.mjs` and `ipc-hw-smoke.mjs`. Control ranges are the sharpest
+  signal and need no readback path: a mis-sized transfer shows up immediately as an absurd min/max.
+  It was verified to FAIL 8/8 against the pre-fix helper and pass after, so it genuinely guards the
+  regression rather than merely passing — the vitest suite cannot reach native code, which is why
+  this guard lives in a script.
+
+- `darwin-arm64` is now hardware-verified for USB vid/pid candidacy, serial readback and the
+  serial-keyed bind path, single-owner IPC coordination over the Unix socket, and transparent
+  helper-death recovery — none of which had been executed on a Mac before. The IORegistry vid/pid
+  emission in `native/macos/helper.m` had been written on Windows and never compiled on macOS; it
+  proved correct as written. See the README's platform table for the current state.
+
+### Added: multi-camera support
+
+The server can now bind and drive more than one attached camera in the same process (previously it
+opened whichever camera it found first and offered no way to pick another).
+
+- Every camera-addressing tool gained an optional `camera` parameter — the target camera's serial
+  number. Omit it with a single camera attached and behavior is unchanged from pre-0.4.0. With
+  several attached, a call that omits `camera` fails with an error naming every attached serial.
+  Exempt: `obsbot_devices`, `obsbot_capture_stop`, `obsbot_capture_list`, `obsbot_debug_probe`.
+  `obsbot_capture_record` and `obsbot_capture_preview` also don't take it — they select a device by
+  `source`, not by serial. `obsbot_capture_snapshot` honors it only for `source:"device"`.
+- Camera identity is the device's serial (read via `UG_GET_SN`), not USB topology — a remembered
+  serial finds its camera after a replug or a port change.
+- One native helper process is spawned per bound camera, lazily on first use, so a multi-camera
+  setup doesn't pay the cost of a camera nobody addressed yet.
+- **Not yet hardware-verified with two cameras.** This path is covered by the unit test suite
+  against fake transports; running two physical Tiny 2s at once hasn't been confirmed on real
+  hardware (a second unit wasn't available for this branch). Single-camera behavior is unaffected
+  either way.
+
+### Fixed
+
+- `obsbot_debug_probe`'s `query` mode now frames a bare GET with the header-only flavor
+  (`flags 0x01`) the device actually answers; previously a payload-less query used the SET framing
+  (`flags 0x25`) and could return a stale echo instead of a real reply. The reply is now also
+  validated against the sent command/sequence before being trusted, guarding against the reply
+  mailbox's previous-value-until-overwritten behavior.

@@ -1,0 +1,635 @@
+# Tiny – Desktop-Ausgabe 0.17.0
+
+Start mit `./start.sh` oder dem Starter **Tiny**. Native GTK-4-Oberfläche für Tiny 2, Logitech C922 Pro und weitere V4L2-Kameras: Livebild, Kamerasteuerung, Bildformate, Kameraprofile, Filter, Fotoserien und Videoaufnahme mit dem Mikrofon der ausgewählten USB-Kamera. [Bedienung, Voraussetzungen und Prüfumfang](docs/DESKTOP.md).
+
+Das Debian-Paket enthält eine private Node.js-22-Laufzeit für das Kamerasteuerungs-Backend. Sie wird getrennt unter `/usr/share/tiny/runtime/` installiert und ersetzt oder verändert keine systemweite Node.js-Installation. Das portable Laufzeitarchiv benötigt weiterhin Node.js 20 oder neuer.
+
+Die folgende Dokumentation beschreibt den weiterhin enthaltenen MCP-Server.
+
+# obsbot-mcp
+
+A cross-platform [Model Context Protocol](https://modelcontextprotocol.io) server that controls an
+**OBSBOT Tiny 2** camera over its standard UVC/USB interface — pan/tilt/roll the gimbal, zoom, AI
+subject tracking, focus/exposure/white-balance/image controls, HDR and field-of-view, plus snapshot,
+preview, and recording — without any vendor SDK. It also controls the **OBSBOT Tail 2** network
+camera over its HTTP/WS API (see [OBSBOT Tail 2](#obsbot-tail-2-network-cameras) below).
+
+## Install
+
+```bash
+npm install obsbot-mcp
+```
+
+## MCP client configuration
+
+Add a stdio server entry pointing at the installed binary (or directly at `dist/index.js`):
+
+```json
+{
+  "mcpServers": {
+    "obsbot": {
+      "command": "obsbot-mcp"
+    }
+  }
+}
+```
+
+If you're running from a local checkout instead of an npm install, point `command`/`args` at
+`node` and the built entry point instead:
+
+```json
+{
+  "mcpServers": {
+    "obsbot": {
+      "command": "node",
+      "args": ["path/to/obsbot-mcp/dist/index.js"]
+    }
+  }
+}
+```
+
+### Debug / diagnostics tools
+
+By default the server advertises only the normal control surface. Pass `--debug` to additionally
+expose the diagnostics surface — the `obsbot_debug_probe` tool (raw XU byte get/set/query) and the
+`raw` 60-byte status block on `obsbot_status`:
+
+```json
+{
+  "mcpServers": {
+    "obsbot": {
+      "command": "node",
+      "args": ["path/to/obsbot-mcp/dist/index.js", "--debug"]
+    }
+  }
+}
+```
+
+With the installed binary, use `"command": "obsbot-mcp"` and `"args": ["--debug"]`.
+
+## Tools
+
+35 tools on Windows and macOS, 34 on Linux (`obsbot_gimbal_move_speed` is unavailable there — see
+[limitations](#linux-gimbal-position-feedback-is-not-live)). `--debug` adds `obsbot_debug_probe` for
+one more. Every Tail 2 camera on the network adds the 32 `obsbot_tail2_*` tools in
+[OBSBOT Tail 2](#obsbot-tail-2-network-cameras) below (all platforms — they are pure TypeScript).
+All names below are current as of v0.4.0 — **every tool was renamed in this
+release and there is no backward-compatible alias**; see [CHANGELOG.md](./CHANGELOG.md) for the
+full old→new mapping if you're updating a caller.
+
+### The `camera` selector
+
+Every camera-addressing tool accepts an optional `camera` parameter: the target camera's serial
+number. Omit it with a single camera attached and nothing changes — this matches the server's
+pre-v0.4.0, single-camera behaviour exactly. With more than one camera attached, a call that omits
+`camera` fails with an error naming every attached serial, so you always know what to pass next.
+
+**Exempt** (no `camera` parameter, ever): `obsbot_devices` (enumerates the whole fleet),
+`obsbot_capture_stop` / `obsbot_capture_list` (address a `sessionId`, not a device), and
+`obsbot_debug_probe` (operates on the current diagnostics transport). Two more tools honor it only
+partially — see **Capture** below.
+
+Multi-camera support is new in v0.4.0. It's exercised by the unit test suite against fakes; running
+two physical Tiny 2s at once has not yet been hardware-verified (see
+[Known limitations](#known-limitations)).
+
+`obsbot_devices` is the way to discover the serials you pass as `camera`: it reports each attached
+camera's `serial` (where obtainable — reading it requires briefly opening the camera), `name`, and
+`status` (`available` | `bound` | `busy`). A camera another process already holds comes back `busy`
+with no serial, since it can't be opened to read one.
+
+### Device & power
+
+| Tool | Parameters | Description |
+|------|------------|-------------|
+| `obsbot_devices` | — | List attached OBSBOT cameras with each one's serial (where obtainable), name, and status (`available`/`bound`/`busy`). A `busy` camera is held by another process. |
+| `obsbot_wake` | `camera`? | Wake the camera/gimbal (sends `"run"`). **Moves the camera:** un-stows the gimbal back to level (pitch ~0). Most control commands also wake it implicitly. |
+| `obsbot_sleep` | `camera`? | Sleep the camera/gimbal (sends `"sleep"`). **Moves the camera:** stows the gimbal face-down at roughly pitch `84`, so `obsbot_gimbal_position` reads ~84 rather than the pose you left. |
+| `obsbot_status` | `camera`? | Read the live status block: `{ awake, hdr, faceAe, aiMode, trackSpeed, fovMode, zoomPercent, focusMode, focusPosition }` (`faceAe` = auto-exposure metering for a detected face; `fovMode` = `wide`\|`medium`\|`narrow`\|`custom`\|`unknown`, where `custom` means a continuous zoom overrode the discrete modes; `zoomPercent` = zoom position, `0`-`100`; `focusMode` = `auto`\|`manual`\|`unknown`). **`focusPosition` appears only in manual mode**, on the same `0`-`100` scale `obsbot_focus_manual` takes — under autofocus the camera echoes the last written value rather than exposing the motor, so a number there would read as a live focus distance while being stale. Focus is a standard UVC control, not part of the status block, so it costs one extra read; a device that can't answer reports `focusMode: "unknown"` rather than failing the whole call. Under `--debug`, also returns the raw 60-byte block as hex. |
+
+### Gimbal (PTZ)
+
+| Tool | Parameters | Description |
+|------|------------|-------------|
+| `obsbot_gimbal_move` | `yaw`, `pitch`, `roll` (degrees, `roll` defaults `0`), `camera`? | Move the gimbal to an absolute angle. Positive yaw pans to the camera's left, positive pitch tilts down. Yaw clamped to `[-150, 150]`, pitch to `[-90, 90]`. Absolute 1:1 degrees, hardware-verified. |
+| `obsbot_gimbal_move_speed` | `yaw`, `pitch`, `roll` (deg/s, clamped to `±150`, `roll` defaults `0`), `autoStopMs` (default `800`), `camera`? | Drive the gimbal at a speed, then auto-stop after `autoStopMs` so it can't run away. Same yaw/pitch sign convention as `gimbal_move`. Returns the speeds actually used. Past its limit the firmware ignores the command outright rather than saturating — 180 deg/s and above move the gimbal exactly 0° — so requests are clamped into the hardware-verified band. **Not available on Linux** — see [limitations](#linux-gimbal-position-feedback-is-not-live). |
+| `obsbot_gimbal_recenter` | `camera`? | Recenter the gimbal — drives it to yaw `0` / pitch `0`. Returns as soon as the command is sent, so poll `obsbot_gimbal_position` if you need to know it arrived. |
+| `obsbot_gimbal_position` | `camera`? | Read the gimbal's current absolute `{ yaw, pitch }` in degrees via standard UVC Pan/Tilt. Valid during a move as well as after one. On Linux this is the last-*commanded* value, not a live in-flight reading — see [limitations](#linux-gimbal-position-feedback-is-not-live). |
+| `obsbot_aim_at_pixel` | `x`, `y`, `frameWidth`, `frameHeight`, `source` (default `"device"`), `camera`? | Point the camera at a pixel from a frame you just captured. Reads the camera's magnification from its own reported state — a discrete FOV mode or a continuous zoom alike — so it needs no FOV or zoom argument and works at any zoom. Refuses while AI tracking is active, when the FOV mode can't be decoded, or when a corrupt zoom reading would resolve to an implausible magnification, and refuses if the camera had to be woken (waking moves the gimbal, invalidating the frame you measured) or if the zoom is still ramping (the frame was captured at a magnification the camera has already left, so wait for the zoom and take a fresh snapshot). `source` **declares** which feed the frame came from (default `device`) — it cannot be inferred from the pixels. A `virtual`/`ndi` frame is accepted, not refused, but only aims correctly if that feed is an unmodified pass-through of the camera; a compositor's rescale or letterbox is invisible in the picture and silently wrong here, so a non-`device` declaration returns a `note` stating that assumption. It reads the live pose to compute the aim, so on Linux it is affected the same way `obsbot_gimbal_position` is — see [limitations](#linux-gimbal-position-feedback-is-not-live). Returns `clamped:true` if the target was outside the gimbal's range, in which case the camera still moves — to the nearest reachable pose. Refuses (`ok:false`) instead of moving when the pixel lies past vertical from the current pose, since the only rotation that reaches it would swing the camera toward the opposite side of the room; tilt toward the pixel first, then re-aim. |
+| `obsbot_zoom_to_fit` | `x`, `y`, `width`, `height`, `frameWidth`, `frameHeight`, `margin` (default `0.1`), `source` (default `"device"`), `camera`? | Frame a region of a frame you just captured: centre the gimbal on it and zoom so the region fills the frame. Same refusal conditions as `obsbot_aim_at_pixel` (AI tracking, undecodable FOV/zoom, a woken camera, a zoom still ramping, an over-the-top target, a non-16:9 frame), and the same `source` declaration, plus a refusal if the region isn't within the frame (edges included) or has non-positive size. `margin` backs the zoom off by that fraction so the region isn't framed edge-to-edge; the *tighter* of the region's two axes sets the zoom, so the whole region stays visible rather than being cropped on one side. Moves the gimbal **before** zooming — zoom is centre-preserving but not target-preserving, so zooming first can push the region out of frame. Zoom ramps rather than jumping, so the tool polls for up to 3s and returns `settled:false` (not an error) if the zoom hadn't arrived in time — check it before trusting a follow-up snapshot. |
+
+#### Aiming at what you can see
+
+`obsbot_capture_snapshot` returns the frame as an image plus its `width`/`height`, so a model can
+locate something in the picture and then point the camera at it:
+
+1. `obsbot_capture_snapshot` — look at the frame
+2. `obsbot_aim_at_pixel` — pass the target's pixel and that frame's dimensions
+3. `obsbot_capture_snapshot` again — confirm it landed, and repeat if needed
+
+Pass the `frameWidth`/`frameHeight` from the same snapshot the pixel came from. Mixing a pixel from
+one frame with dimensions from another aims at the wrong place, and nothing can detect it.
+
+**The snapshot must be `source: "device"`.** `obsbot_capture_snapshot` can also read from
+`source: "virtual"` or `"ndi"`, which come from OBSBOT Center's own output rather than the camera's
+raw stream. Those are framed and cropped by OBSBOT Center, not by this camera's optics, so the
+measured field-of-view constants this tool relies on don't describe them — aiming from a virtual or
+NDI frame lands in the wrong place with no way to detect it. Only use a `device`-source snapshot's
+pixel and dimensions here.
+
+The tool reads the camera's magnification itself — a discrete FOV mode or a continuous zoom alike
+(`m = 3*ratio-2`, measured on hardware to better than 0.05%) — so there is no FOV or zoom argument to
+get wrong, and it works at any zoom. It refuses rather than guessing when AI tracking is on (tracking
+drives the gimbal and would fight the aim), when the FOV mode can't be decoded, when a corrupt zoom
+reading would resolve to an implausible magnification, or when the camera had to
+be woken from sleep (waking moves the gimbal, so the frame you measured no longer matches where the
+camera is pointing — take a fresh snapshot and retry).
+
+#### Framing what you can see
+
+`obsbot_zoom_to_fit` extends the same idea from a point to a region: instead of just centring on a
+pixel, it also zooms so that region fills the frame.
+
+1. `obsbot_capture_snapshot` — look at the frame
+2. Pick a bounding box around whatever should fill the frame (a face, a whiteboard, ...)
+3. `obsbot_zoom_to_fit` — pass the box (`x`, `y`, `width`, `height`) and that frame's dimensions
+4. `obsbot_capture_snapshot` again — confirm the framing, and repeat if needed
+
+It shares `obsbot_aim_at_pixel`'s refusals (AI tracking, undecodable FOV/zoom, a woken camera, a zoom still ramping, a
+non-16:9 frame), and adds one of its own: the region must lie within the frame — edges included, so a
+region that already IS the full frame is valid — with a positive width and height, or the call refuses
+rather than guess what a negative width or an off-frame box was supposed to mean.
+
+`margin` (default `0.1`, i.e. 10%) backs the requested zoom off by that fraction so the region isn't
+framed exactly edge-to-edge — some breathing room around it survives small aim/zoom error. The
+region's two axes rarely need the same zoom to fill the frame; the tool always picks the *smaller* of
+the two required magnifications, because zooming to the larger one would fill one axis by cropping the
+other. The result is clamped to the camera's `[1x, 4x]` magnification range (reported via `clamped`) —
+a region demanding more zoom than the camera has still gets the closest fit available, rather than
+being refused outright.
+
+The gimbal moves before the zoom is commanded. Zoom re-centres what's already in frame but does not
+keep a specific pixel under the crosshair as it changes — zooming first can push the region's centre
+out of frame entirely, which would make the subsequent move aim at a pixel that no longer means what
+it did when the caller measured it.
+
+Zoom is not instantaneous: on this hardware it ramps toward the commanded value rather than jumping to
+it, so a status read taken immediately after commanding it can catch it mid-transit (observed:
+commanding ratio 1.5 read back partway there before settling). `obsbot_zoom_to_fit` polls for up to 3
+seconds waiting for the zoom to arrive and returns `settled:false` — not an error — if it didn't. A
+frame captured while the zoom is still moving is at an unknown magnification, so check `settled`
+before trusting a follow-up snapshot; a `false` just means the camera was moving slower than expected,
+not that anything failed.
+
+### Gimbal presets
+
+Three on-device preset slots (1–3). Slots are **create-once**: `obsbot_preset_save` requires an
+empty slot (delete first to reuse one); every other preset tool requires the slot to already be
+occupied. Each tool re-reads the slot list after writing and returns a structured `{ ok:false }`
+failure if the device didn't land the change.
+
+| Tool | Parameters | Description |
+|------|------------|-------------|
+| `obsbot_preset_list` | `camera`? | Read the three preset slots: occupied/empty, name, and pose in degrees. |
+| `obsbot_preset_save` | `slot` (`1`\|`2`\|`3`), `camera`? | Save the gimbal's current live pose into an **empty** slot. |
+| `obsbot_preset_recall` | `slot` (`1`\|`2`\|`3`), `camera`? | Recall an **occupied** slot, driving the gimbal to its saved pose. |
+| `obsbot_preset_update` | `slot` (`1`\|`2`\|`3`), `camera`? | Overwrite an **occupied** slot with the gimbal's current live pose. |
+| `obsbot_preset_rename` | `slot` (`1`\|`2`\|`3`), `name`, `camera`? | Rename an **occupied** slot (names over 40 bytes are truncated). |
+| `obsbot_preset_delete` | `slot` (`1`\|`2`\|`3`), `camera`? | Delete an **occupied** slot, freeing it for `obsbot_preset_save`. |
+
+### Zoom
+
+Two tools, not one — they ride different transports (standard UVC vs. the vendor command frame)
+and produce different physical zoom at the same commanded `ratio`, so merging them would silently
+change what `ratio` means. Pick by which behaviour you need.
+
+| Tool | Parameters | Description |
+|------|------------|-------------|
+| `obsbot_zoom_uvc` | `ratio` (`1.0`–`2.0`), `camera`? | Standard UVC zoom: set an absolute zoom ratio, clamped to `[1.0, 2.0]`. Snaps to the requested target exactly. Waits for the zoom to arrive and returns `settled` — the ramp is not instant (a full `1.0`→`2.0` sweep takes about 2.4s), and `obsbot_aim_at_pixel` / `obsbot_zoom_to_fit` refuse while it is in flight, so returning early would only move the failure downstream. `settled:false` means it hadn't arrived within the timeout; the command was still sent. |
+| `obsbot_zoom_vendor` | `ratio` (`1.0`–`2.0`), `speed` (default `0`), `camera`? | Vendor zoom path with adjustable speed: zoom to a ratio at a chosen speed (`0` = device default, `1`–`10` slow→fast, `255` = maximum). **Its ratio scale differs from `obsbot_zoom_uvc`'s** and may not land exactly on the requested target — see [Known limitations](#known-limitations). |
+
+### AI tracking
+
+| Tool | Parameters | Description |
+|------|------------|-------------|
+| `obsbot_ai_track` | `enabled` (bool), `mode` (default `"normal"`), `camera`? | Enable/disable AI tracking and choose the mode: a human framing (`normal \| upper-body \| close-up \| headless \| lower-body`) or a scene mode (`group \| whiteboard \| desk \| hand`). Polls status and returns `{ verified, matched }` (`matched:false` = no subject tracked yet). |
+| `obsbot_ai_track_speed` | `speed`: `"standard" \| "sport"`, `camera`? | Set the tracking-speed preset (Center's Standard/Sport): `standard` (slower follow) or `sport` (snappier). |
+| `obsbot_focus_face` | `enabled` (bool), `camera`? | Enable or disable face-priority autofocus. |
+
+### Image & lens
+
+Focus, white balance, and exposure each split into a dedicated `_auto` and `_manual` tool in
+v0.4.0 (previously one tool with a mode parameter) — auto and manual take different parameters, so
+splitting them lets each schema say exactly what it needs.
+
+| Tool | Parameters | Description |
+|------|------------|-------------|
+| `obsbot_image_fov` | `fov`: `"wide" \| "medium" \| "narrow"`, `camera`? | Set the field of view: wide (86°), medium (78°), narrow (65°). |
+| `obsbot_image_hdr` | `enabled` (bool), `camera`? | Toggle HDR/WDR imaging on or off. |
+| `obsbot_focus_auto` | `camera`? | Enable continuous autofocus. |
+| `obsbot_focus_manual` | `position` (`0`–`100`, default `50`), `camera`? | Set the focus motor to `position` (near→far). |
+| `obsbot_image_exposure_auto` | `priority` (`"global" \| "face"`, optional), `camera`? | Enable auto-exposure; optional `priority` selects global vs face metering. |
+| `obsbot_image_exposure_manual` | `level` (`0`–`100`, default `50`), `camera`? | Set exposure `level` (0 darkest → 100 brightest). |
+| `obsbot_image_wb_auto` | `camera`? | Enable auto white balance. |
+| `obsbot_image_wb_manual` | `temperature` (Kelvin, default `5000`), `camera`? | Set a colour temperature (clamped to device range). |
+| `obsbot_image_adjust` | `control`, `level` (`0`–`100`), `camera`? | Adjust `brightness \| contrast \| hue \| saturation \| sharpness \| gain \| backlight-compensation`; `level` maps onto the device range. **`gain` and `backlight-compensation` are not implemented on the Tiny 2** (it reports them as zero-length controls) and are refused with an error; the other five work. |
+
+### Capture
+
+**`obsbot_capture_record` and `obsbot_capture_preview` do not take `camera`.** They select a device
+by `source` (`device`/`virtual`/`ndi`) through ffmpeg/ffplay, not by serial — there is no
+serial-to-ffmpeg-device mapping yet. **`obsbot_capture_snapshot` honors `camera` only for
+`source:"device"`**; for `source:"virtual"`/`"ndi"` the pixel source is still resolved by device
+name, independent of `camera`.
+
+| Tool | Parameters | Description |
+|------|------------|-------------|
+| `obsbot_capture_snapshot` | `resolution` (`256`–`1920`, default `640`), `quality` (`1`–`100`, default `80`), `settleMs` (`0`–`15000`, default `600`), `source` (default `"device"`), `camera`? (source:"device" only) | Grab one still frame and return it as an image (for framing/lighting/exposure checks). `resolution` is the longest edge in pixels — larger costs proportionally more tokens. `source`: `device \| virtual \| ndi`. Also returns `sourceFormat` — the format the capture graph negotiated, e.g. `MJPG 1920x1080@30.00` — because **frame rate selects the field of view on this camera** (see limitations); Windows only, absent means unknown. A source that connects lazily (NDI) may need a larger `settleMs`. |
+| `obsbot_capture_record` | `durationSec` (optional), `audio` (default `true`), `outputPath` (optional), `source` (default `"device"`) | Start recording to MP4. Open-ended recordings auto-stop after 60 min; audio uses the OBSBOT mic; defaults to `~/Videos/OBSBOT` on every platform, including macOS, where that is not the usual `~/Movies`. Returns a `sessionId`. **Needs ffmpeg.**¹ No `camera`. |
+| `obsbot_capture_preview` | `source` (default `"device"`) | Open a live preview window. Returns a `sessionId`. **Needs ffplay.**¹ No `camera`. `device` is pinned to 1080p60 mjpeg for smooth motion — which costs field of view (see limitations). `virtual`/`ndi` negotiate instead, since neither offers mjpeg and pinning it there prevents the device opening at all. |
+| `obsbot_capture_stop` | `sessionId` | Stop a recording or preview session (recordings are finalized gracefully). No `camera`. |
+| `obsbot_capture_list` | — | List active recording/preview sessions. No `camera`. |
+
+### Diagnostics (`--debug` only)
+
+| Tool | Parameters | Description |
+|------|------------|-------------|
+| `obsbot_debug_probe` | `mode`: `"get" \| "set" \| "query"`, plus `selector`, `length`, `hex`, `opcode`, `payloadHex` | RE/diagnostics only — raw XU byte get/set and framed table queries. Advertised only under `--debug`. No `camera`. |
+
+¹ `record`/`preview` shell out to **ffmpeg**/**ffplay** (install: `winget install Gyan.FFmpeg`
+on Windows, `brew install ffmpeg` on macOS, `apt install ffmpeg` on Linux). `snapshot` does **not**
+need ffmpeg — it grabs the frame through the native helper.
+
+## OBSBOT Tail 2 (network cameras)
+
+The Tail 2 is a different animal: a network PTZ camera (NDI/RTSP/SRT/RTMP output, ethernet + WiFi,
+and a USB-C port that is either MTP for footage offload or a UVC webcam). The tools below use its
+**network control plane** — an HTTP REST API plus a WebSocket status push, documented in
+[`TAIL2-PROTOCOL.md`](./TAIL2-PROTOCOL.md) from on-device reverse engineering. That makes the whole
+module **pure TypeScript with zero platform-specific code**: no native helper, no helper build,
+identical behavior on Windows/Linux/macOS.
+
+In UVC mode the camera also answers the standard UVC controls over USB (pan, tilt, zoom, pan/tilt
+speed, focus, exposure, white balance), and its vendor Extension Unit gives tracking on/off, human
+tracking mode, tracking speed and Auto Zoom. This server has no Tail 2 USB transport yet, so none
+of that is exposed as a tool; presets, portrait rotation and roll trim are network only. See
+[TAIL2-PROTOCOL.md §11](./TAIL2-PROTOCOL.md#11-usb-c-uvc-mode-measured-2026-09-26-windows-directshow-2026-09-27-linux-uvcvideo)
+for what was measured.
+
+Getting started:
+
+1. Put the Tail 2 on your network (it defaults to DHCP on ethernet).
+2. Call `obsbot_tail2_scan` once — it listens ~5 s for the camera's own mDNS announcements (it
+   multicasts its MAC, name and IPs every few seconds, the same channel OBSBOT Center discovers
+   by) and falls back to an HTTP subnet sweep only on multicast-filtered networks. Or set
+   `OBSBOT_TAIL2_HOSTS` (comma-separated addresses) in the server's environment, or just pass any
+   Tail 2 tool a `camera` parameter holding the camera's IP.
+
+The `camera` selector for these tools is the camera's **MAC** (its stable identity), or its
+`device_name`, or its host address — case-insensitive. Omitted with one Tail 2 registered it
+resolves to that one.
+
+| Tool | Parameters | Description |
+|------|------------|-------------|
+| `obsbot_tail2_devices` | — | List registered Tail 2 cameras (mac, name, host(s)). Registration is not liveness. |
+| `obsbot_tail2_scan` | — | Discover Tail 2 cameras: ~5 s mDNS listen (the camera's own announcements), HTTP subnet sweep fallback. Registers what it found. |
+| `obsbot_tail2_status` | `camera`? | One WebSocket status push: the full live block — power, rec, portrait, AI mode + tracking settings, zoom ratio, roll bias, focus modes, NDI/RTSP/SRT/RTMP flags, SD card, presets with poses, and per-subsystem health. No live yaw/pitch — Tail 2 gimbal moves are open-loop. |
+| `obsbot_tail2_info` | `camera`? | Identity + static config in one call: device_info, range (zoom **1.0–12.0**, focus 1–100, WB 2000–10000 K), networkconfig (NDI/stream settings). |
+| `obsbot_tail2_zoom` | `ratio` (`1.0`–`12.0`), `speed` (`1`–`10`, default `5`), `camera`? | Absolute zoom on the camera's own ratio scale. `speed` is required by the firmware. Returns `settled` (readback-verified) — see below. **Silently pins at 5.0 (the optical ceiling) unless hybrid zoom is unlocked — see `obsbot_tail2_hybrid_zoom`.** |
+| `obsbot_tail2_hybrid_zoom` | `enabled`, `camera`? | Unlock (or re-lock) the 5–12x digital zoom region — the switch OBSBOT Center owns, which does not exist in the REST API (zoom above 5.0 is acknowledged but pinned until this runs). Speaks Center's private UDP-9999 protocol directly, both checksums decoded; verified by readback from the live status snapshot (`zoom_infos.digital_enable`), works with Center closed. Hardware-verified both directions 2026-09-30. |
+| `obsbot_tail2_recenter` | `camera`? | Gimbal recenter (yaw/pitch/roll 0). Open-loop: returns on ack. Can drop AI tracking to `none`; re-enable with `obsbot_tail2_ai_track`. |
+| `obsbot_tail2_gimbal_position` | `camera`? | Live gimbal pose in degrees (yaw/pitch/roll) + zoom ratio, via save-scratch-preset → read → delete (~2 s). Needs one empty preset slot (probe slots are self-cleaning). |
+| `obsbot_tail2_gimbal_speed` | `yaw`? `pitch`? `roll`? (±150 speed), `durationMs`? (100–5000, default 500), `camera`? | Jog the gimbal (the joystick primitive) with automatic stop. Measured: command 20 ≈ 7.9°/s; positive yaw command DECREASES recorded yaw. Disable AI tracking first. |
+| `obsbot_tail2_gimbal_move` | `yaw`? `pitch`? (±178°), `camera`? | Absolute move via closed loop (jog → pose read → correct, ≤5 rounds, ±1.5° tolerance). Slow by design (~1 s per small move, more for large). Refuses while AI tracking is active. Hardware-verified 2026-09-30: 4° move converged in one iteration. |
+| `obsbot_tail2_gimbal_invert` | `enable`?, `camera`? | Read (bare call) or set (verified) control-direction inversion. |
+| `obsbot_tail2_record` | `enable`?, `camera`? | Read/control the recording switch. Needs storage — check `obsbot_tail2_status`'s sdcard field. |
+| `obsbot_tail2_capture_photo` | `camera`? | Trigger a still photo (to storage). |
+| `obsbot_tail2_focus` | `mode`? (`afc`/`afs`/`mf`), `position`? (0–100), `camera`? | Read or set focus. Position only in `mf` (mode-gated; the tool refuses otherwise). |
+| `obsbot_tail2_exposure` | `mode`?, `face`?, `evbias`?, `iso`?, `shutter`?, `camera`? | Read (mode-appropriate) or set exposure: auto (face-priority AE + EV bias) or manual (ISO 100–6400, shutter `1/N`). Note: the firmware rejects JSON-integer evbias — the client always sends `0.0`-style floats. |
+| `obsbot_tail2_image_adjust` | `control`?, `value`? (0–100), `styleMode`?, `camera`? | Read or set image style (brightness/contrast/hue/saturation/sharpness). Control writes are gated to `styleMode: manual` — the tool applies a given styleMode first and refuses otherwise. |
+| `obsbot_tail2_hdr` | `enabled`?, `camera`? | Read/set HDR. |
+| `obsbot_tail2_wb` | `mode`?, `temperature`? (2000–10000 K), `camera`? | Read/set white balance (6 modes + Kelvin in manual). |
+| `obsbot_tail2_stream` | `output`? (`ndi`/`rtsp`/`srt`/`off`), `camera`? | Read/set the ONE active network output. The programmatic way to arm SRT for `obsbot_tail2_snapshot` — no Center needed. |
+| `obsbot_tail2_only_me` | `enabled`?, `camera`? | Read/set OnlyMe human-tracking (track one person, not everyone). |
+| `obsbot_tail2_audio` | `volume`?, `mute`?, `camera`? | Read/set audio input. |
+| `obsbot_tail2_zoom_type` | `type`? (`normal`/`shot`/`halfBody`/`fullBody`/`P7`/`P9`/`P16`/`P24`), `camera`? | Read/set the auto-zoom framing pattern (Center's tracking slider). Writes gated: requires human tracking armed. |
+| `obsbot_tail2_preset_speed` | `speed`? (1–5), `camera`? | Read/set the preset switching speed. |
+| `obsbot_tail2_usb_mode` | `mode`? (`mtp`/`uvc`), `camera`? | Read/set the USB-C function mode. |
+| `obsbot_tail2_antiflicker` | `mode`? (`off`/`50hz`/`60hz`), `camera`? | Read/set anti-flicker. |
+| `obsbot_tail2_af_track` | `mode`? (`global`/`face`/`front`), `camera`? | Read/set the autofocus track mode. |
+| `obsbot_tail2_iso_range` | `min`?, `max`? (100–6400), `camera`? | Read/set the auto-ISO range (double slider; omitted bounds keep current). |
+| `obsbot_tail2_gesture` | `lockedTarget`?, `recording`?, `zoom`?, `zoomFactor`?, `camera`? | Read (bare) or set the gesture-control switches and zoom factor. |
+| `obsbot_tail2_stream_config` | `encoder`?, `resolution`?, `bitrate`?, `camera`? | Read (bare, incl. RTSP URLs) or set the stream encoder config. Resolution writes gated on output off. |
+| `obsbot_tail2_export_log` | `path`, `camera`? | Download the full diagnostic bundle (the Export Log archive: ust.json, status.json, factory records, kernel logs) to `path`. ~10–20 s. |
+| `obsbot_tail2_live_status` | `camera`? | Fresh runtime snapshot distilled: live gimbal pose (euler+joint), zoom internals incl. `hybridDigitalEnable`, runtime exposure truth, temps, boot stage, accessories. |
+| `obsbot_tail2_zone_tracking` | `enabled`, `camera`? | Toggle zone tracking (UDP 9999 key 03). No readback exists — effect shows in tracking behavior. |
+| `obsbot_tail2_auto_zoom_speed` | `speed` (1–10), `camera`? | Set the AI auto-zoom framing speed (UDP key 0x17; distinct from manual zoom speed). No readback. |
+| `obsbot_tail2_track_custom` | `enabled`?, `pan`?, `tilt`? (1–10), `panAuto`?, `tiltAuto`?, `camera`? | Read (bare) or configure custom tracking speed: per-axis speeds, Auto buttons (readback-verified via tracking_settings). Axis locks shown read-only — no known write path. |
+| `obsbot_tail2_track_target` | `x`, `y` (0.01–0.99), `camera`? | **Tap-to-track**: engage AI tracking on the subject at a normalized frame coordinate (snapshot pixel ÷ frame size). Undocumented endpoint, hardware-measured. |
+| `obsbot_tail2_focus_point` | `x`?, `y`? (0.01–0.99), `camera`? | **Tap-to-focus**: move the focus window to a normalized frame coordinate and start a point focus (afc/afs only). Bare call reads the window. |
+| `obsbot_tail2_portrait` | `enable`, `camera`? | Motorized 90° barrel rotation for portrait framing — no Tiny 2 equivalent. Verified on orientation feedback; retry if `settled:false` (writes can be silently dropped *while the motor is in motion* — measured). |
+| `obsbot_tail2_roll_bias` | `angle` (±90), `camera`? | Roll trim in degrees (horizon correction / deliberate tilt). |
+| `obsbot_tail2_ai_track` | `enabled`, `mode` (default `"humanTrackingSingleMode"`), `camera`? | Enable/disable AI tracking. Modes are the camera's own enum: human (single/group), animal (normal/close-up), object tracking (`objectTracking`/`objectTrackingNormal`/`objectTrackingCloseUp`). While active, tracking owns the gimbal. |
+| `obsbot_tail2_track_speed` | `speed`: `"superLazy" \| "lazy" \| "slow" \| "fast" \| "crazy" \| "customized"`, `camera`? | Tracking follow speed — the Tail 2's own six-speed enum (NOT the Tiny 2's standard/sport pair). |
+| `obsbot_tail2_preset_list` | `camera`? | The three preset slots: occupied/empty, decoded name, pose in degrees + zoom ratio. |
+| `obsbot_tail2_preset_save` | `slot` (`1`–`3`), `name`? (default `P1`/`P2`/`P3`), `camera`? | Save the CURRENT live pose into a slot — aim first, then save. **Overwrites** an occupied slot (unlike the Tiny 2's create-once), and there is no pose-by-value write in this API at all. |
+| `obsbot_tail2_preset_recall` | `slot`, `camera`? | Drive gimbal + zoom to a saved pose. Refuses an empty slot. Arrival verified via the zoom readback (gimbal axes are open-loop — the Tail 2 reports no live pose). Disable AI tracking first or it fights the move. |
+| `obsbot_tail2_preset_delete` | `slot`, `camera`? | Free a slot. |
+| `obsbot_tail2_preset_rename` | `slot`, `name`, `camera`? | Rename a slot (base64 handled transparently). |
+| `obsbot_tail2_snapshot` | `resolution` (`256`–`1920`, default `640`), `quality` (`1`–`100`, default `80`), `camera`? | Grab one still frame and return it as an image. Pulls from the camera's **SRT output** (ffmpeg SRT caller, port 5000) — requires SRT listener mode enabled in OBSBOT Center first (it disables NDI while active and is cleared by a camera reboot; Center only allows changing streaming settings while the output is off, so a failure usually means SRT is off — re-enable and retry). Hardware-verified 2026-09-26. |
+
+**Every write is verified by readback** (`settled` in the result): the Tail 2 acknowledges commands
+it may drop while an actuator is mid-motion — `{"code":200}` means *acknowledged*, not *applied*
+(measured 2026-09-26; see TAIL2-PROTOCOL.md §8). `settled:false` means the ladder ran out before
+the readback agreed; the command was still sent — retry it.
+
+Known Tail 2 gaps (details in TAIL2-PROTOCOL.md §9): image-control writes via REST
+are unprobed, and snapshot depends on the camera's SRT output being enabled from
+OBSBOT Center (exclusive with NDI, cleared by reboots — the tool explains this when
+SRT is off; on this firmware the RTSP output never serves despite its enable flag).
+The camera's control API is also **unauthenticated** — anyone on your LAN can drive
+it, including poweroff.
+
+## Supported platforms
+
+- **Windows x64** — supported today. The native helper is built from source in `native/windows/`
+  (CMake + MSVC); the published npm package ships a prebuilt binary so end users need no toolchain.
+- **Linux x64** — supported from v0.2. The native helper is in `native/linux/` (CMake + GCC);
+  it uses **V4L2** for standard UVC controls (zoom, focus, exposure, pan/tilt, white balance,
+  image controls) and `UVCIOC_CTRL_QUERY` for vendor Extension Unit commands (gimbal speed/AI
+  tracking, wake/sleep, HDR, FOV). Snapshots capture a MJPEG or YUYV frame via V4L2 mmap streaming
+  and encode to JPEG using **libjpeg**. The `linux-x64` prebuilt binary ships with the published npm
+  package. Build dependencies: `build-essential cmake libjpeg-dev libv4l-dev`.
+
+  Gimbal *position* reads (`obsbot_gimbal_position`) reflect the last-commanded value, not live
+  in-flight position — see ["Linux gimbal position feedback"](#linux-gimbal-position-feedback-is-not-live)
+  below for why, and what would fix it.
+- **macOS 14+ (Apple Silicon and Intel)** — supported. The native helper is in `native/macos/`
+  (Objective-C + **IOKit**/**AVFoundation**). It uses IOKit USB control transfers for both standard
+  UVC controls and vendor Extension Unit commands, and AVFoundation for enumeration and snapshots.
+  Both `darwin-arm64` and `darwin-x64` prebuilt binaries ship with the published npm package
+  (`darwin-x64` also covers Apple Silicon running Node under Rosetta, where `process.arch` reports
+  `x64`). macOS 14 is the floor because the helper uses `AVCaptureDeviceTypeExternal`; the build
+  pins `-mmacosx-version-min` so the binary does not inherit the build machine's OS as its
+  minimum.
+
+  Note on macOS specifically: `UVCAssistant` (a DriverKit system extension) owns the camera's UVC
+  *interfaces* exclusively, so `USBInterfaceOpen` — and even `USBInterfaceOpenSeize` — fail with
+  `kIOReturnExclusiveAccess`. The helper therefore opens the USB *device*, which is not locked, and
+  issues UVC control requests on its default control endpoint. This coexists with `UVCAssistant`:
+  the camera keeps working as a normal webcam while under control, so no driver-replacement step
+  is needed.
+
+### Building the native helper (Linux)
+
+```bash
+cd native/linux
+mkdir build && cd build
+cmake ..
+make -j$(nproc)
+make install  # copies to native/prebuilt/linux-x64/
+```
+
+### Linux gimbal position feedback is not live
+
+`obsbot_gimbal_position` on Linux reports the last position `obsbot_gimbal_move`/
+`obsbot_gimbal_recenter` commanded — not a live, in-flight reading. Hardware testing (2026-07-21)
+confirmed the OBSBOT Tiny 2's `CT_PANTILT_ABSOLUTE` control genuinely tracks live position — a raw
+USB read of that same control, bypassing the kernel, showed a real slew progressing in real time.
+The reason plain V4L2 (`VIDIOC_G_CTRL`) never sees that is that `uvcvideo` caches the control's
+value and serves the cache instead of re-querying the device (confirmed via
+`VIDIOC_QUERY_EXT_CTRL`, which reports no `V4L2_CTRL_FLAG_VOLATILE`). The driver invalidates that
+cache when the device sends a UVC Control Change interrupt — which this camera's firmware never
+does, and never advertises support for.
+
+Getting a genuinely live reading through V4L2 requires briefly detaching the kernel driver from
+the camera's control interface and reading the control directly over raw USB — but detaching that
+interface (even briefly, even without writing anything) breaks any concurrent video capture on this
+device: streaming and control share one kernel-managed USB function, so pulling the driver off one
+takes both down together. That makes a libusb-based workaround incompatible with anything actually
+using the camera as a webcam at the same time, which ruled it out as a shipped default.
+
+**A kernel patch has been submitted upstream** ([`media: uvcvideo: query pan/tilt position from
+the device on every read`](https://lore.kernel.org/linux-media/20260725212332.64927-1-jordan.mymail@gmail.com/),
+July 2026 — awaiting review, not merged). It marks `CT_PANTILT_ABSOLUTE` volatile so the driver
+queries the device on every read; verified on this hardware to track a live slew through plain
+`VIDIOC_G_CTRL`, concurrently with streaming. If it is accepted, `obsbot_gimbal_position` becomes
+live on Linux with no code changes needed here. Until it ships in a kernel near you:
+
+- `obsbot_gimbal_move` and `obsbot_gimbal_recenter` work normally — hardware-verified,
+  repeatedly, via direct V4L2 `VIDIOC_S_CTRL` writes. Their target values are known and clamped
+  before being sent, so they can't exceed the gimbal's mechanical range regardless of the missing
+  feedback.
+- **`obsbot_gimbal_move_speed` is not available on Linux** (hidden from the tool list entirely,
+  not just refused at runtime). A speed×duration burst has no target position to clamp — without a
+  live reading to confirm where the gimbal actually is, there's no way to bound it against the
+  mechanical limits before it gets there. It remains available on Windows/macOS.
+
+### Building the native helper (macOS)
+
+```bash
+make -C native/macos    # -> native/prebuilt/darwin-arm64/obsbot-helper
+```
+
+Requires the Xcode command line tools. CMake works too (`cmake -S native/macos -B
+native/macos/build && cmake --build native/macos/build`), which is what CI uses.
+
+## Known limitations
+
+What has actually been exercised against hardware, and what hasn't:
+
+| Platform | Status |
+|---|---|
+| `win32-x64` | **Hardware-verified** — mid-session disconnect recovery (`ERROR_DEV_NOT_EXIST`, measured not guessed), camera arrival/removal push events, proactive re-bind across a **same-port** replug with no tool call, white balance, and the ProcAmp control ranges, on a real Tiny 2. A **different-port** replug recovers on the next tool call rather than proactively — see below |
+| `linux-x64` | **Hardware-verified** — gimbal absolute moves and recenter via V4L2 (20 consecutive moves with a live preview running), and the arc-second scaling fix confirmed by physical swing. Gimbal *position* is not live and `obsbot_gimbal_move_speed` is unavailable — see below |
+| `darwin-arm64` | **Hardware-verified** — control, gimbal movement **and per-axis position readback**, zoom, snapshot, USB vid/pid candidacy, serial readback and serial-keyed binding, single-owner IPC coordination, helper-death recovery, and **unaided recovery from an unplug/replug**, on a real Tiny 2 |
+| `darwin-x64` | **Build-verified only** — compiles with the right architecture and deployment target, never executed |
+
+- **The Intel (`darwin-x64`) helper has never been run.** No Intel Mac was available to test it. It
+  cross-compiles cleanly and is packaged, but nothing has confirmed it talks to a camera. It also
+  covers Apple Silicon running Node under Rosetta, where `process.arch` reports `x64` — likewise
+  untested. Reports from Intel users are welcome.
+- **macOS 14 or newer is required**, and macOS runtime is verified on **26.5 only**. The helper uses
+  `AVCaptureDeviceTypeExternal` (macOS 14+), so the build pins `-mmacosx-version-min=14.0`. The
+  binary will *load* on 14 through 25, but behavior there is untested — in particular the UVC
+  control path relies on `UVCAssistant` holding the camera's UVC interfaces while leaving the USB
+  device itself openable. That is how current macOS behaves; older releases are unconfirmed.
+- **The first snapshot on macOS raises a camera permission prompt.** The helper is a plain CLI tool
+  with no bundle identifier, so macOS attributes camera access to whichever app spawned it — your
+  MCP client — and that app is named in the prompt and holds the grant. Approve once; the grant
+  survives helper updates, since it is keyed to the client rather than to the helper's signature.
+- **AI tracking overrides manual gimbal moves.** When AI tracking is active (the Tiny 2's default
+  on wake), a commanded pan/tilt executes and is then pulled back to the tracked subject —
+  `obsbot_gimbal_position` shows the yaw/pitch move out and decay back to rest. This is the camera's
+  behaviour, not a bug: turn tracking off for unopposed manual control.
+- **The camera may not enumerate through a USB hub or dock.** A Tiny 2 connected through a USB-C
+  dock was invisible to `ioreg` and `system_profiler` entirely — not just to this server. If
+  `obsbot_devices` comes back empty, try a direct connection before assuming a software fault.
+- **Only the OBSBOT Tiny 2 is supported.** On Windows and macOS candidacy is gated on the Remo USB
+  vendor ID plus a known-model product ID (`0x3564`/`0xFEF8`), so no other model is detected at
+  all — and a name-matching software source, such as the "OBSBOT Virtual Camera" that OBSBOT Center
+  registers, is rejected because it reports no vid/pid. Linux still matches by name, because its
+  helper does not report vid/pid yet, so a different OBSBOT may be *found* there — but the vendor
+  command set is Tiny 2 specific either way. (On macOS the virtual camera cannot appear at all: the
+  helper enumerates USB devices through the IORegistry, which a software camera never enters.)
+- **The vendor reply mailbox is unreliable for several seconds after a replug.** On 2026-07-21 a
+  Tiny 2 was seen returning only the host's own echoed request frame from the vendor reply mailbox
+  (XU selector 2) — magic byte `0xaa` cleared to `0x00`, every other byte identical — for a
+  continuous 3.2 s. `readSerial()` threw, `bind()` found no serial, and every tool needing a bound
+  camera failed with "no OBSBOT camera found" while the device was plainly healthy: correct
+  vid/pid, opened fine, XU node 2, live status block on selector 6.
+
+  That was unexplained for a while. It is now reproducible: **immediately after a USB
+  re-enumeration**. Polling `readSerial` every 50 ms across a replug failed 22 times in 80 attempts
+  spread over the first 14 s, against 0 in 120 in steady state; the first read after arrival showed
+  exactly the echoed-request signature above, and later failures showed the reply slot populated
+  but with its magic byte still zeroed. Ruled out as causes: stale per-process device state (the
+  same long-lived helper read a brand-new uniqueID cleanly at t+49 ms), re-opening the device
+  (0/40 either way), and the per-transport sequence counter restarting at 1 (0/80).
+
+  Consequence for callers: a bind attempted in the first seconds after a replug can fail even
+  though the camera is fine. Retrying works. The arrival-driven re-bind now retries on a bounded
+  ladder for this reason, and a `readSerial` failure reports what the mailbox actually held
+  (echoed request / unparseable / a reply to another request) rather than only "no valid reply".
+  Ruled out earlier and still ruled out: reply latency (polled 3.2 s), the wrong extension unit
+  (the VideoControl interface exposes exactly one, `bUnitID 2`), the wrong `wLength` (every XU
+  selector is 60 bytes by `GET_LEN`), the reply arriving on another selector (1–19 swept), camera
+  sleep state, and contention from OBSBOT Center.
+- **Recovery after a replug is proactive, but not in every case, and it differs by platform.**
+  The server subscribes to OS camera arrival/removal events, so in the common case a replugged
+  camera re-binds itself with no tool call — `obsbot_devices` reports it `bound` again on its own.
+  Every cell below is hardware-measured:
+
+  | scenario | macOS | Windows | Linux |
+  |---|---|---|---|
+  | same-port replug | proactive | proactive | next tool call |
+  | different-port replug | proactive | next tool call | next tool call |
+
+  Where it says "next tool call", nothing is stranded — the call that follows detects the stale
+  binding, prunes it and re-binds. It costs one failed call, which is exactly how every platform
+  behaved before these events existed. The Windows difference comes from its arrival filter
+  requiring a path it has already enumerated, which is also what stops the Tiny 2's *audio*
+  interface from being reported as a second camera; macOS has no equivalent problem because it
+  re-binds by serial and ignores the path. Linux emits no bus events at all yet.
+
+  Note the interaction with the mailbox entry above: a re-bind attempted immediately after a
+  replug can still lose the first attempt, so the server retries on a short bounded ladder.
+
+- **Two-camera operation is not yet hardware-verified.** The `camera` selector and the
+  per-camera device registry are covered by the unit test suite against fake transports; running
+  two physical Tiny 2s attached at once has not been confirmed on real hardware (a second unit
+  wasn't available). Single-camera use is unaffected either way.
+- **Linux gimbal position feedback is not live, and `obsbot_gimbal_move_speed` is unavailable
+  there as a result.** See ["Linux gimbal position feedback is not live"](#linux-gimbal-position-feedback-is-not-live)
+  above — a kernel patch fixing this at the source [has been submitted upstream](https://lore.kernel.org/linux-media/20260725212332.64927-1-jordan.mymail@gmail.com/)
+  (July 2026, awaiting review). `obsbot_gimbal_move` and
+  `obsbot_gimbal_recenter` are unaffected; both are hardware-verified to work normally.
+  `obsbot_aim_at_pixel` **is** affected — it depends on a live pose reading to compute the aim, the
+  same way `obsbot_gimbal_position` does.
+- **`obsbot_zoom_vendor`'s ratio scale doesn't match `obsbot_zoom_uvc`'s at the same `ratio`.** A
+  hardware snapshot comparison at `ratio: 2.0` showed the vendor path framed tighter than the UVC
+  path. Whether the vendor-side ratio encoding is off by a scale factor, or the two zoom controls
+  simply have different physical ranges, isn't determined yet — one comparison isn't enough to
+  tell. Tracked separately; use `obsbot_zoom_uvc` if you need the ratio to land exactly.
+
+## No proprietary SDK
+
+This project speaks the camera's USB protocol directly through the OS's standard UVC driver stack and
+does **not** use, link, bundle, or ship any vendor SDK. See [`PROTOCOL.md`](./PROTOCOL.md) for the
+protocol reference (frame format, checksum, command table).
+
+## How it works
+
+The camera exposes two independent control surfaces, both reachable through the OS's standard UVC
+(USB Video Class) driver stack — this project never talks to the USB device directly, so the OS keeps
+mediating access and the camera remains usable as a normal webcam at the same time commands are sent:
+
+- **Standard UVC controls** — zoom (`CT_ZOOM_ABSOLUTE`), focus and exposure (`IAMCameraControl`),
+  gimbal position readback (UVC Pan/Tilt), and the image controls plus white balance
+  (`IAMVideoProcAmp`) — are the camera's built-in UVC properties, driven via DirectShow on Windows.
+- **Vendor commands** — gimbal moves, recenter, wake/sleep, AI tracking, HDR, and field of view —
+  are sent through the camera's UVC Extension Unit, driven via `IKsControl::KsProperty` against the
+  XU's topology node on Windows.
+
+Both are issued through a small native helper process (`obsbot-helper.exe` on Windows, `obsbot-helper`
+on Linux) that the Node server spawns and talks to over a line-delimited JSON-RPC protocol on
+stdin/stdout. The helper is the only platform-specific piece; the codec (frame encoding, CRC-16/USB
+checksum, command table), transport abstraction, device manager, and MCP tool definitions are all pure
+TypeScript/JavaScript and shared across platforms.
+
+## Verifying against real hardware
+
+`scripts/e2e.mjs` drives the built stack (`dist/`) against a physically connected camera: it wakes the
+device, zooms in, pans the gimbal, recenters, zooms back out, and puts the camera to sleep, with a short
+pause and console log before each step so a human can watch it happen. **This moves the physical gimbal —
+only run it under supervision:**
+
+```bash
+npm run build
+node scripts/e2e.mjs
+```
+
+### Testing changes through the live MCP tools
+
+Two traps make it easy to test the wrong thing and believe the result. Both cost real time on
+2026-07-25.
+
+**Rebuild, then start one server from the new build.** The MCP server runs from `dist/`, so a
+source change is invisible until `npm run build`. This project coordinates concurrent clients by
+electing a single owner process (see `IPC-DESIGN.md`), and **the owner executes every tool call**,
+whichever session made it. The owner is the newest build alive: when a server starts from a newer
+build than the owner's, the owner finishes the call in flight, releases the camera, and hands the
+endpoint over. Reloading the server in one MCP client is therefore enough. Other sessions stay open
+and their calls are served by the new build.
+
+Three things to know:
+
+- **The tool list of other sessions does not refresh.** A session that started on an older build
+  keeps the list it had; its calls run the new code. Reload that session's server to get new tools.
+- **A server that predates the handover cannot hand over** (0.7.0 and earlier). A newer server
+  will not run calls on it, and says so: `an older instance owns the camera endpoint and cannot
+  hand it over`. Stop the old process once; after that, rebuilds take over on their own.
+- **Use `npm run build` and `npm run build:helper`.** They stamp the build with its identity
+  (`dist/build-info.json`). A bare `tsc`, or a helper copied into place by hand, is not stamped and
+  does not count as a newer build.
+
+To see which build will run your next call, read the last `ipc role=` line in the server's log.
+`role=owner` means this process; `role=client owner-pid=… owner-build=…` names the one that will.
+Claude Code keeps the log under `~/Library/Caches/claude-cli-nodejs/<project>/mcp-logs-obsbot/` on
+macOS.
+
+```bash
+# Linux / macOS — every server process, with when it started
+ps -o pid,lstart,command -p $(pgrep -f "obsbot.*dist/index.js" | paste -sd, -)
+```
+
+```powershell
+# Windows
+Get-CimInstance Win32_Process -Filter "Name='node.exe'" |
+  Where-Object { $_.CommandLine -like "*Obsbot*" } |
+  Select-Object ProcessId, CreationDate
+```
+
+Set `OBSBOT_IPC_NAME` to give a server a rendezvous endpoint of its own (1–64 characters from
+`A-Z a-z 0-9 . _ -`). Test harnesses do this so they leave a live session alone. Two owners on one
+machine can contend for the camera, so it is not for everyday use.
+
+**Frame rate selects the field of view, so the preview shows less than snapshots.** At 1920×1080 this
+camera has two different windows onto the sensor and the *frame rate* picks between them — not the
+codec. Measured at one pose and one zoom: MJPEG@30 vs YUYV@30 came out at scale 1.00001 over 2382
+inliers, i.e. the same field to within a fifth of a pixel, while MJPEG@60 is a **1.214× crop of both**.
+`obsbot_capture_preview` pins 60fps for smooth motion, so it shows ~21% less of the room than
+`obsbot_capture_snapshot`, which negotiates 1080p30. Framing by eye in the preview and then aiming at a
+pixel from a snapshot will not agree. The geometry constants describe the 30fps field. Any measurement
+you make must state pixel format **and** frame rate; neither a resolution nor a codec alone identifies
+the field.
+
+**A preview holds the camera stream, so snapshots fail while one is open.** `obsbot_capture_preview`
+and `obsbot_capture_snapshot` both need the device stream, and on Windows the second one gets
+`Camera is in use by another application`. This matters for the aim loop above, which is
+snapshot → aim → snapshot: stop the preview around each snapshot, or work without one. Gimbal control
+is unaffected — it uses control transfers, not the stream — so `obsbot_aim_at_pixel` itself works fine
+with a preview running. The error text suggests `source: "virtual"` or `"ndi"` as a workaround. That is safe for *looking*,
+and safe for *aiming* only if the feed is an unmodified pass-through of the camera — declare it with
+the `source` parameter on `obsbot_aim_at_pixel` / `obsbot_zoom_to_fit` and read the `note` it returns.
+A compositor that rescales or letterboxes the frame silently invalidates the geometry.

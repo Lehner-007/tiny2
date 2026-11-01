@@ -1,0 +1,122 @@
+export interface Snapshot {
+  mime: string;
+  width: number;
+  height: number;
+  base64: string;
+  /**
+   * The format the capture graph actually negotiated upstream, e.g.
+   * "MJPG 1920x1080@30.00" — NOT the format the frame is delivered in, which is
+   * always JPEG by the time it reaches here.
+   *
+   * It matters because frame rate selects the field of view on this camera:
+   * 1920x1080@30 and 1920x1080@60 are different windows onto the sensor (a
+   * 1.214x crop), so the angle a pixel corresponds to depends on it. The
+   * geometry constants in geometry/aim.ts describe the 30fps field.
+   *
+   * Optional: only the Windows helper reports it today, so absence means
+   * "unknown", not "wrong".
+   */
+  sourceFormat?: string;
+}
+
+export interface SnapshotOpts {
+  path?: string;
+  maxDim?: number;
+  quality?: number;
+  settleMs?: number;
+}
+
+/** Thrown when a snapshot fails because another app holds the capture pin. */
+export class CameraBusyError extends Error {
+  constructor(message = "camera in use by another application") {
+    super(message);
+    this.name = "CameraBusyError";
+  }
+}
+
+/**
+ * OBSBOT_LIVE_POSE override for the live-pose behaviours (pose settling before
+ * composition in mcp/tools.ts, and the Linux closed-loop move retry in
+ * transport/linux.ts). TRI-STATE: `1/true/yes/on` forces them on, `0/false/no/off`
+ * forces them off, unset (or empty) means "decide automatically". Returns the
+ * forced boolean, or undefined to defer to a transport's own detection.
+ *
+ * Automatic detection is per-transport: see ObsbotTransport.livePoseReads. On
+ * Linux it is a read-latency probe (transport/linux.ts) that measures whether the
+ * driver serves pan/tilt from cache or re-queries the device — mechanism-agnostic
+ * and immune to the kernel-version/backport traps a uname gate walks into.
+ */
+export const livePoseOverride = (): boolean | undefined => {
+  const v = process.env.OBSBOT_LIVE_POSE;
+  if (v === undefined || v === "") return undefined;
+  return /^(1|true|yes|on)$/i.test(v);
+};
+
+/** Back-compat: the plain on/off reading of the override (unset => off). */
+export const livePoseEnabled = (): boolean => livePoseOverride() === true;
+
+export interface ObsbotTransport {
+  sendVendor(frame: Buffer): Promise<void>;
+  /**
+   * Send a vendor request frame (SET_CUR on the vendor selector) and read the
+   * reply frame back (GET_CUR on the response selector). Returns the raw reply
+   * bytes; callers parse with parseFrame.
+   */
+  recvVendor(frame: Buffer, length?: number): Promise<Buffer>;
+  /**
+   * Read the camera's flat status block via GET_CUR on the status selector
+   * (no request frame is sent). Returns the raw block; callers use decodeStatus.
+   */
+  recvStatus(length?: number): Promise<Buffer>;
+  /** Send a raw payload to an arbitrary UVC extension-unit selector (e.g. FOV/HDR on selector 6). */
+  xuRaw(selector: number, data: Buffer): Promise<void>;
+  /** RE/diagnostics: GET_CUR read `length` bytes from an arbitrary XU selector (no request frame sent). */
+  xuGetRaw(selector: number, length: number): Promise<Buffer>;
+  zoomRange(): Promise<{ min: number; max: number }>;
+  zoomSet(units: number): Promise<void>;
+  /** Grab one still frame (grab-and-release). Throws CameraBusyError if the pin is busy. */
+  snapshot(opts: SnapshotOpts): Promise<Snapshot>;
+  /** IAMCameraControl::Set(property, value, flags) — used for focus. */
+  camCtrlSet(property: number, value: number, flags: number): Promise<void>;
+  /** IAMCameraControl::GetRange(property) → device-unit min/max. */
+  camCtrlRange(property: number): Promise<{ min: number; max: number }>;
+  /** Read the current value + flags of an IAMCameraControl property (GET_CUR). */
+  camCtrlGet(property: number): Promise<{ value: number; flags: number }>;
+  /**
+   * Whether pan/tilt reads report LIVE device position (vs a cached setpoint),
+   * which decides whether the pose-settle and closed-loop move-retry behaviours
+   * run. OBSBOT_LIVE_POSE overrides; otherwise the transport decides (Linux
+   * probes read latency, macOS/Windows default off). Cached after first call.
+   */
+  livePoseReads(): Promise<boolean>;
+  /** IAMVideoProcAmp::Set(property, value, flags) — used for white balance. */
+  procAmpSet(property: number, value: number, flags: number): Promise<void>;
+  /** IAMVideoProcAmp::GetRange(property) → device-unit min/max. */
+  procAmpRange(property: number): Promise<{ min: number; max: number }>;
+  /**
+   * Move the gimbal to an absolute yaw/pitch angle in degrees. Positive yaw =
+   * camera's left; positive pitch = tilt down.
+   * Platform note: Linux uses V4L2 pan_absolute/tilt_absolute (proven to move
+   * the physical gimbal and keep V4L2 readback working). Windows/macOS use
+   * vendor V3 frames (AI_SET_GIM_MOTOR_DEG).
+   */
+  gimbalSet(yawDeg: number, pitchDeg: number, rollDeg?: number): Promise<void>;
+  /**
+   * Drive the gimbal at a yaw/pitch speed (platform-specific units), then
+   * automatically stop after autoStopMs. Positive yaw = camera's left.
+   * Platform note: Linux approximates by converting speed × duration to an
+   * absolute V4L2 pan_absolute/tilt_absolute move. Windows/macOS use vendor
+   * V3 frames (AI_SET_GIM_SPEED).
+   */
+  gimbalSpeed(yaw: number, pitch: number, roll: number, autoStopMs: number): Promise<void>;
+  /** Recenter the gimbal to yaw=0, pitch=0. */
+  gimbalRecenter(): Promise<void>;
+  /**
+   * Read the camera's 14-char ASCII serial number (UG_GET_SN): sends a
+   * header-only vendor GET on the vendor XU selector and polls the reply
+   * mailbox for a valid, matching reply. Throws if no valid reply arrives.
+   */
+  readSerial(): Promise<string>;
+  nextSeq(): number;
+  close(): Promise<void>;
+}

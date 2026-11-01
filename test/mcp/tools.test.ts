@@ -1,0 +1,2741 @@
+import { expect, test, vi } from "vitest";
+import { z } from "zod";
+import { createTools } from "../../src/mcp/tools.js";
+import type { ObsbotTransport } from "../../src/transport/transport.js";
+import { livePoseOverride } from "../../src/transport/transport.js";
+import { CameraBusyError } from "../../src/transport/transport.js";
+import type { DeviceManager } from "../../src/device/manager.js";
+import { AmbiguousCameraError } from "../../src/device/manager.js";
+import type { CaptureManager } from "../../src/capture/manager.js";
+import { CaptureError, FfmpegMissingError } from "../../src/capture/manager.js";
+import { buildFrame } from "../../src/codec/frame.js";
+import { CAMERA_CONTROL_PAN, CAMERA_CONTROL_TILT } from "../../src/codec/commands.js";
+import { aimAtPixel, GIMBAL_YAW_LIMIT_DEG } from "../../src/geometry/aim.js";
+
+// Real awake status block captured from the device (starts 0x25, byte[2]=0 → awake).
+const HEALTHY_STATUS_AWAKE = Buffer.from(
+  "2501000200000001010158020001013200000000017f2100000143000000553c00031000000000000000000000000000000000000000000000000000",
+  "hex",
+);
+// Same block with the sleep flag set (byte[2]=1), as observed on a sleeping camera.
+const HEALTHY_STATUS_ASLEEP = (() => {
+  const b = Buffer.from(HEALTHY_STATUS_AWAKE);
+  b[0x02] = 1;
+  return b;
+})();
+
+function makeFakeTransport() {
+  let seq = 0;
+  // Mutable, per-instance copy so zoomSet can echo into it: the real device's
+  // zoomPercent tracks actual travel, and a fake that pins it at 0 forever makes
+  // every zoom_to_fit test that uses the production settle defaults wait out the
+  // full timeout for no reason. Echoing here is both faster AND more faithful to
+  // the real device, which is what makes the settle logic worth testing at all.
+  // zoomSet's `units` arg is already on the 0-100 scale here because zoomRange()
+  // below returns {min:0, max:100} — zoomRatioToUnits(ratio, 0, 100) computes
+  // exactly the target zoomPercent — so no unit conversion is needed to echo it.
+  const status = Buffer.from(HEALTHY_STATUS_AWAKE);
+  return {
+    sendVendor: vi.fn(async (_frame: Buffer) => {}),
+    recvVendor: vi.fn(async (_frame: Buffer, _length?: number) => Buffer.alloc(60)),
+    recvStatus: vi.fn(async (_length?: number) => status),
+    xuRaw: vi.fn(async (_selector: number, _data: Buffer) => {}),
+    xuGetRaw: vi.fn(async (_selector: number, _length: number) => Buffer.alloc(60)),
+    zoomRange: vi.fn(async () => ({ min: 0, max: 100 })),
+    zoomSet: vi.fn(async (units: number) => {
+      status[0x04] = Math.max(0, Math.min(255, Math.round(units)));
+    }),
+    camCtrlSet: vi.fn(async (_p: number, _v: number, _f: number) => {}),
+    camCtrlRange: vi.fn(async (_p: number) => ({ min: 0, max: 100 })),
+    camCtrlGet: vi.fn(async (_p: number) => ({ value: 0, flags: 0 })),
+    procAmpSet: vi.fn(async (_p: number, _v: number, _f: number) => {}),
+    procAmpRange: vi.fn(async (_p: number) => ({ min: 2800, max: 6500 })),
+    snapshot: vi.fn(async () => ({
+      mime: "image/jpeg",
+      width: 1280,
+      height: 720,
+      base64: "QUJD",
+    })),
+    gimbalSet: vi.fn(async (_yaw: number, _pitch: number, _roll?: number) => {}),
+    gimbalSpeed: vi.fn(async (_yaw: number, _pitch: number, _roll: number, _autoStopMs: number) => {}),
+    gimbalRecenter: vi.fn(async () => {}),
+    livePoseReads: vi.fn(async () => livePoseOverride() === true),
+    readSerial: vi.fn(async () => "FAKESERIAL0001"),
+    nextSeq: vi.fn(() => ++seq),
+    close: vi.fn(async () => {}),
+  } satisfies ObsbotTransport;
+}
+
+// createTools now takes the DeviceManager directly and derives per-camera
+// resolution from it: getTransport(camera) => mgr.get(camera), plus mgr.invalidate
+// / mgr.takeReconnected for the readiness gate's self-heal. The fake records the
+// `camera` arg on every get() so the selector tests can assert what was forwarded.
+// First arg is the transport get() should return (defaults to a fresh fake);
+// second is the enumerate() device list used by obsbot_capture_snapshot's virtual/ndi
+// source lookup; third is the listCameras() result used by obsbot_devices.
+function makeFakeMgr(
+  transport?: ObsbotTransport,
+  devices: unknown[] = [],
+  cameras: unknown[] = [{ serial: "AAA", name: "OBSBOT Tiny 2", status: "available" }],
+) {
+  const t = transport ?? makeFakeTransport();
+  return {
+    get: vi.fn(async (_camera?: string) => t),
+    invalidate: vi.fn(async (_camera?: string) => {}),
+    takeReconnected: vi.fn((_camera?: string) => false),
+    list: vi.fn(async () => devices),
+    listCameras: vi.fn(async () => cameras),
+    openFirstObsbot: vi.fn(async () => t),
+  } as unknown as DeviceManager;
+}
+
+function makeFakeCapture(over: Partial<CaptureManager> = {}): CaptureManager {
+  return {
+    startRecord: vi.fn(async () => ({
+      id: "cap1", kind: "record", pid: 1, source: "device",
+      outputPath: "C:\\Videos\\OBSBOT\\obsbot-x.mp4", durationSec: 3600,
+      startedAtIso: "2026-07-13T00:00:00.000Z",
+    })),
+    startPreview: vi.fn(async () => ({
+      id: "cap2", kind: "preview", pid: 2, source: "device",
+      startedAtIso: "2026-07-13T00:00:00.000Z",
+    })),
+    stop: vi.fn(async () => ({ kind: "record", outputPath: "C:\\Videos\\OBSBOT\\obsbot-x.mp4", graceful: true })),
+    list: vi.fn(() => []),
+    stopAll: vi.fn(),
+    ...over,
+  } as unknown as CaptureManager;
+}
+
+function findTool(tools: ReturnType<typeof createTools>, name: string) {
+  const t = tools.find((t) => t.name === name);
+  if (!t) throw new Error(`tool not found: ${name}`);
+  return t;
+}
+
+// obsbot_gimbal_move_speed is hidden specifically on Linux (see createTools),
+// but its clamping/negation logic is shared, platform-agnostic handler code —
+// these tests exercise that logic from a platform where the tool isn't hidden,
+// independent of whatever platform the test suite itself happens to run on.
+function withPlatform<T>(platform: string, fn: () => T): T {
+  const original = Object.getOwnPropertyDescriptor(process, "platform")!;
+  Object.defineProperty(process, "platform", { value: platform });
+  try {
+    return fn();
+  } finally {
+    Object.defineProperty(process, "platform", original);
+  }
+}
+
+function createToolsAsIfNotLinux(
+  ...args: Parameters<typeof createTools>
+): ReturnType<typeof createTools> {
+  return withPlatform("win32", () => createTools(...args));
+}
+
+test("obsbot_gimbal_move_speed is hidden on Linux — no live position feedback to bound it", () => {
+  const names = withPlatform("linux", () => createTools(makeFakeMgr()).map((t) => t.name));
+  expect(names).not.toContain("obsbot_gimbal_move_speed");
+  // The absolute-move tools remain fully available — only the unbounded speed
+  // burst is affected.
+  expect(names).toContain("obsbot_gimbal_move");
+  expect(names).toContain("obsbot_gimbal_recenter");
+});
+
+test("obsbot_gimbal_move_speed is present on non-Linux platforms", () => {
+  const names = withPlatform("win32", () => createTools(makeFakeMgr()).map((t) => t.name));
+  expect(names).toContain("obsbot_gimbal_move_speed");
+});
+
+// Hard break: the v0.4.0 1:1 renames (naming spec §3). Old names must not
+// resolve — there are no aliases.
+const RENAMES: [string, string][] = [
+  ["obsbot_list_devices", "obsbot_devices"],
+  ["obsbot_ptz_move_angle", "obsbot_gimbal_move"],
+  ["obsbot_ptz_move_speed", "obsbot_gimbal_move_speed"],
+  ["obsbot_zoom_absolute", "obsbot_zoom_uvc"],
+  ["obsbot_zoom_speed", "obsbot_zoom_vendor"],
+  ["obsbot_ai_tracking", "obsbot_ai_track"],
+  ["obsbot_face_focus", "obsbot_focus_face"],
+  ["obsbot_fov", "obsbot_image_fov"],
+  ["obsbot_hdr", "obsbot_image_hdr"],
+  ["obsbot_image_control", "obsbot_image_adjust"],
+  ["obsbot_get_status", "obsbot_status"],
+  ["obsbot_snapshot", "obsbot_capture_snapshot"],
+  ["obsbot_record_start", "obsbot_capture_record"],
+  ["obsbot_preview_start", "obsbot_capture_preview"],
+];
+test.each(RENAMES)("%s is renamed to %s (old name gone)", (oldName, newName) => {
+  // createToolsAsIfNotLinux, not createTools: obsbot_gimbal_move_speed is hidden
+  // on Linux (tested separately above), which would make this rename-presence
+  // check platform-dependent for that one row — this test is only about the
+  // rename having happened, so it always checks from a platform where nothing
+  // is hidden.
+  const names = createToolsAsIfNotLinux(makeFakeMgr()).map((t) => t.name);
+  expect(names).toContain(newName);
+  expect(names).not.toContain(oldName);
+});
+
+// Hard break: the v0.4.0 splits (naming spec §3, judgement call §4.1). Each
+// combined mode/state tool becomes two distinct tools; the combined name has
+// no alias.
+const SPLITS: [string, string, string][] = [
+  ["obsbot_set_run_status", "obsbot_wake", "obsbot_sleep"],
+  ["obsbot_focus", "obsbot_focus_auto", "obsbot_focus_manual"],
+  ["obsbot_white_balance", "obsbot_image_wb_auto", "obsbot_image_wb_manual"],
+  ["obsbot_exposure", "obsbot_image_exposure_auto", "obsbot_image_exposure_manual"],
+];
+test.each(SPLITS)("%s splits into %s and %s (old name gone)", (oldName, newA, newB) => {
+  const names = createTools(makeFakeMgr()).map((t) => t.name);
+  expect(names).toEqual(expect.arrayContaining([newA, newB]));
+  expect(names).not.toContain(oldName);
+});
+
+test("obsbot_zoom_uvc clamps ratio above max and calls zoomSet with max-mapped units", async () => {
+  const transport = makeFakeTransport();
+  const mgr = makeFakeMgr(transport);
+  const tools = createTools(mgr);
+  const tool = findTool(tools, "obsbot_zoom_uvc");
+
+  const result = await tool.handler({ ratio: 99 });
+
+  expect(transport.zoomRange).toHaveBeenCalledTimes(1);
+  expect(transport.zoomSet).toHaveBeenCalledTimes(1);
+  expect(transport.zoomSet).toHaveBeenCalledWith(100); // ratio clamped to 2.0 -> max units
+  // settled comes from the fake echoing zoomSet into zoomPercent, so the zoom is
+  // already at target on the first settle poll.
+  expect(result).toEqual({ ok: true, ratio: 2.0, settled: true });
+});
+
+test("obsbot_wake sends run status without a state arg", async () => {
+  const transport = makeFakeTransport();
+  const tools = createTools(makeFakeMgr(transport));
+  const result = await findTool(tools, "obsbot_wake").handler({});
+
+  expect(transport.sendVendor).toHaveBeenCalledTimes(1);
+  const frame = transport.sendVendor.mock.calls[0][0] as Buffer;
+  expect(frame[16]).toBe(0); // encodeSetRunStatus("run") -> wake=0
+  expect(result).toEqual({ ok: true, state: "run" });
+});
+
+test("obsbot_sleep sends sleep status without a state arg", async () => {
+  const transport = makeFakeTransport();
+  const tools = createTools(makeFakeMgr(transport));
+  const result = await findTool(tools, "obsbot_sleep").handler({});
+
+  expect(transport.sendVendor).toHaveBeenCalledTimes(1);
+  const frame = transport.sendVendor.mock.calls[0][0] as Buffer;
+  expect(frame[16]).toBe(1); // encodeSetRunStatus("sleep") -> sleep=1
+  expect(result).toEqual({ ok: true, state: "sleep" });
+});
+
+test("obsbot_gimbal_move_speed sends move then auto-stop", async () => {
+  const transport = makeFakeTransport();
+  const mgr = makeFakeMgr(transport);
+  const tools = createToolsAsIfNotLinux(mgr);
+  const tool = findTool(tools, "obsbot_gimbal_move_speed");
+
+  const result = await tool.handler({ yaw: 10, pitch: 5, roll: 0, autoStopMs: 1 });
+
+  expect(transport.gimbalSpeed).toHaveBeenCalledTimes(1);
+  expect(transport.gimbalSpeed).toHaveBeenCalledWith(10, 5, 0, 1);
+  // yaw/pitch echo the speeds actually used after clamping, so a caller can see
+  // when its request was bounded rather than silently ignored by the firmware.
+  // Kept as an exact-shape assertion so an unintended field cannot creep in.
+  expect(result).toEqual({ ok: true, yaw: 10, pitch: 5, stopped: true });
+});
+
+test("obsbot_gimbal_move_speed negates yaw so +yaw pans camera-left (matches gimbal_move)", async () => {
+  // Firmware velocity-yaw is inverted vs position-yaw: +yaw drives the gimbal RIGHT on
+  // AI_SET_GIM_SPEED but LEFT on AI_SET_GIM_MOTOR_DEG (HW-observed). The tool normalizes
+  // so a caller's +yaw means the same physical direction (camera-left) on both tools.
+  const transport = makeFakeTransport();
+  const tools = createToolsAsIfNotLinux(makeFakeMgr(transport));
+  const tool = findTool(tools, "obsbot_gimbal_move_speed");
+
+  await tool.handler({ yaw: 40, pitch: 0, roll: 0, autoStopMs: 0 });
+
+  // The yaw inversion is handled by gimbalSpeed on the transport; gimbalSpeed was
+  // called with the raw (non-negated) yaw values as the tool receives them.
+  expect(transport.gimbalSpeed).toHaveBeenCalledWith(40, 0, 0, 0);
+});
+
+test("obsbot_gimbal_recenter sends a single vendor frame", async () => {
+  const transport = makeFakeTransport();
+  const mgr = makeFakeMgr(transport);
+  const tools = createTools(mgr);
+  const tool = findTool(tools, "obsbot_gimbal_recenter");
+
+  const result = await tool.handler({});
+
+  expect(transport.gimbalRecenter).toHaveBeenCalledTimes(1);
+  expect(result).toEqual({ ok: true });
+});
+
+// --- B1b: the per-camera `camera` selector ----------------------------------
+// Every camera-addressing tool gains an optional `camera` (the serial). The
+// handler forwards it to DeviceManager.get(camera) via the readiness gate, so
+// the right camera is targeted. Omitted + one camera attached => get(undefined)
+// yields that single camera (identical to the pre-selector behaviour). The
+// EXEMPT tools (obsbot_devices, capture stop/list, debug_probe) take no camera.
+
+function schemaKeys(tool: { schema: z.ZodTypeAny }): string[] {
+  return Object.keys((tool.schema as z.ZodObject<z.ZodRawShape>).shape);
+}
+
+test("camera selector: a camera-addressing tool forwards the given serial to mgr.get", async () => {
+  const transport = makeFakeTransport();
+  const mgr = makeFakeMgr(transport);
+  const tools = createTools(mgr);
+  const tool = findTool(tools, "obsbot_gimbal_recenter");
+
+  await tool.handler({ camera: "SERIAL-A-123" });
+
+  expect(vi.mocked(mgr.get)).toHaveBeenCalledWith("SERIAL-A-123");
+});
+
+test("camera selector: omitting camera resolves the single camera via mgr.get(undefined)", async () => {
+  const transport = makeFakeTransport();
+  const mgr = makeFakeMgr(transport);
+  const tools = createTools(mgr);
+  const tool = findTool(tools, "obsbot_gimbal_recenter");
+
+  const result = await tool.handler({});
+
+  expect(vi.mocked(mgr.get)).toHaveBeenCalledWith(undefined);
+  expect(result).toEqual({ ok: true }); // single-camera behaviour unchanged
+});
+
+test("camera selector: a camera-addressing tool advertises an optional `camera` in its schema", () => {
+  const tools = createTools(makeFakeMgr());
+  expect(schemaKeys(findTool(tools, "obsbot_gimbal_recenter"))).toContain("camera");
+  // Optional: a call with no camera still validates.
+  expect(() => findTool(tools, "obsbot_gimbal_recenter").schema.parse({})).not.toThrow();
+});
+
+test("camera selector: an ambiguous no-camera call surfaces the AmbiguousCameraError message (not swallowed)", async () => {
+  const mgr = makeFakeMgr();
+  // Several cameras attached + no selector => mgr.get(undefined) throws. The gate
+  // treats a throwing getTransport as unreachable; the constraint is that the
+  // "specify one of: <serials>" message reaches the caller rather than being lost.
+  vi.mocked(mgr.get).mockRejectedValue(new AmbiguousCameraError(["SER-A", "SER-B"]));
+  const tools = createTools(mgr);
+  const tool = findTool(tools, "obsbot_gimbal_recenter");
+
+  const result = await tool.handler({});
+
+  expect(result).toMatchObject({ ok: false, reason: "unreachable" });
+  const error = (result as { error: string }).error;
+  expect(error).toMatch(/specify one of/i);
+  expect(error).toMatch(/SER-A/);
+  expect(error).toMatch(/SER-B/);
+});
+
+test("camera selector: the exempt obsbot_devices has NO camera field in its schema", () => {
+  const tools = createTools(makeFakeMgr());
+  expect(schemaKeys(findTool(tools, "obsbot_devices"))).not.toContain("camera");
+});
+
+test("camera selector: exempt capture-session and debug tools have NO camera field", () => {
+  const tools = createTools(makeFakeMgr(), makeFakeCapture(), true); // debug: expose debug_probe
+  for (const name of ["obsbot_capture_stop", "obsbot_capture_list", "obsbot_debug_probe"]) {
+    expect(schemaKeys(findTool(tools, name))).not.toContain("camera");
+  }
+});
+
+// A 60-byte status block: awake, with the AI-mode tuple (m,n) at 0x18/0x1c so the
+// handler's post-write verify (poll-until-settled) can read the landed framing.
+function aiStatusBlock(m: number, n: number): Buffer {
+  const b = Buffer.alloc(60);
+  b[0x02] = 0; // awake (gate reads this too)
+  b[0x18] = m; // AI mode tuple, first value
+  b[0x1c] = n; // AI mode tuple, second value
+  return b;
+}
+
+test("obsbot_ai_track enable defaults to normal framing: [16 02 02 00] to sel 6, verifies aiMode", async () => {
+  const transport = makeFakeTransport();
+  transport.recvStatus = vi.fn(async () => aiStatusBlock(2, 0)); // awake + normal
+  const tools = createTools(makeFakeMgr(transport));
+  const tool = findTool(tools, "obsbot_ai_track");
+
+  const result = await tool.handler({ enabled: true });
+
+  expect(transport.xuRaw).toHaveBeenCalledTimes(1);
+  const [selector, data] = transport.xuRaw.mock.calls[0];
+  expect(selector).toBe(6);
+  expect([...data.subarray(0, 4)]).toEqual([0x16, 0x02, 0x02, 0x00]);
+  expect(transport.sendVendor).not.toHaveBeenCalled();
+  expect(result).toMatchObject({ ok: true, enabled: true, mode: "normal", verified: "normal", matched: true });
+});
+
+test("obsbot_ai_track enable in close-up framing writes byte[3]=0x02 and verifies close-up", async () => {
+  const transport = makeFakeTransport();
+  transport.recvStatus = vi.fn(async () => aiStatusBlock(2, 2)); // awake + close-up
+  const tools = createTools(makeFakeMgr(transport));
+  const tool = findTool(tools, "obsbot_ai_track");
+
+  const result = await tool.handler({ enabled: true, mode: "close-up" });
+
+  const [selector, data] = transport.xuRaw.mock.calls[0];
+  expect(selector).toBe(6);
+  expect([...data.subarray(0, 4)]).toEqual([0x16, 0x02, 0x02, 0x02]);
+  expect(result).toMatchObject({ ok: true, enabled: true, mode: "close-up", verified: "close-up", matched: true });
+});
+
+test("obsbot_ai_track disable writes [16 02 00 00] and verifies no-tracking", async () => {
+  const transport = makeFakeTransport();
+  transport.recvStatus = vi.fn(async () => aiStatusBlock(0, 0)); // awake + no-tracking
+  const tools = createTools(makeFakeMgr(transport));
+  const tool = findTool(tools, "obsbot_ai_track");
+
+  const result = await tool.handler({ enabled: false });
+
+  const [selector, data] = transport.xuRaw.mock.calls[0];
+  expect(selector).toBe(6);
+  expect([...data.subarray(0, 4)]).toEqual([0x16, 0x02, 0x00, 0x00]);
+  expect(result).toMatchObject({ ok: true, enabled: false, verified: "no-tracking", matched: true });
+});
+
+test("obsbot_ai_track enable in whiteboard scene mode writes [16 02 04 00] and verifies whiteboard", async () => {
+  const transport = makeFakeTransport();
+  transport.recvStatus = vi.fn(async () => aiStatusBlock(4, 0)); // awake + whiteboard
+  const tools = createTools(makeFakeMgr(transport));
+  const tool = findTool(tools, "obsbot_ai_track");
+
+  const result = await tool.handler({ enabled: true, mode: "whiteboard" });
+
+  const [selector, data] = transport.xuRaw.mock.calls[0];
+  expect(selector).toBe(6);
+  expect([...data.subarray(0, 4)]).toEqual([0x16, 0x02, 0x04, 0x00]);
+  expect(transport.sendVendor).not.toHaveBeenCalled();
+  expect(result).toMatchObject({ ok: true, enabled: true, mode: "whiteboard", verified: "whiteboard", matched: true });
+});
+
+test("obsbot_ai_track enable in hand scene mode writes byte[2]=0x03 and verifies hand", async () => {
+  const transport = makeFakeTransport();
+  transport.recvStatus = vi.fn(async () => aiStatusBlock(3, 0)); // awake + hand (m=3 on this firmware)
+  const tools = createTools(makeFakeMgr(transport));
+  const tool = findTool(tools, "obsbot_ai_track");
+
+  const result = await tool.handler({ enabled: true, mode: "hand" });
+
+  const [selector, data] = transport.xuRaw.mock.calls[0];
+  expect(selector).toBe(6);
+  expect([...data.subarray(0, 4)]).toEqual([0x16, 0x02, 0x03, 0x00]);
+  expect(result).toMatchObject({ ok: true, enabled: true, mode: "hand", verified: "hand", matched: true });
+});
+
+test("obsbot_ai_track rejects a retired framing name via zod", async () => {
+  const transport = makeFakeTransport();
+  const tools = createTools(makeFakeMgr(transport));
+  const tool = findTool(tools, "obsbot_ai_track");
+  await expect(tool.handler({ enabled: true, mode: "human-close-up" })).rejects.toThrow();
+});
+
+test("gated command returns the readiness error and does NOT act when unreachable", async () => {
+  const transport = makeFakeTransport();
+  transport.recvStatus = vi.fn(async () => {
+    throw new Error("KsProperty GET failed");
+  });
+  const tools = createTools(makeFakeMgr(transport));
+  const tool = findTool(tools, "obsbot_ai_track");
+  const result = await tool.handler({ enabled: true });
+  expect(result).toMatchObject({ ok: false, reason: "unreachable" });
+  expect(transport.xuRaw).not.toHaveBeenCalled();
+});
+
+test("gated command auto-wakes an asleep camera before acting", async () => {
+  let n = 0;
+  const asleep = Buffer.alloc(60);
+  asleep[0x02] = 1;
+  const transport = makeFakeTransport();
+  // First read asleep (triggers wake); then awake + normal framing so the post-write
+  // verify settles immediately instead of polling the full window.
+  transport.recvStatus = vi.fn(async () => (n++ === 0 ? asleep : aiStatusBlock(2, 0)));
+  const tools = createTools(makeFakeMgr(transport));
+  const tool = findTool(tools, "obsbot_ai_track");
+  const result = await tool.handler({ enabled: true });
+  expect(transport.sendVendor).toHaveBeenCalledTimes(1); // wake frame
+  expect(transport.xuRaw).toHaveBeenCalledTimes(1); // the actual command, after wake
+  expect(result).toMatchObject({ ok: true, enabled: true });
+});
+
+test("obsbot_devices returns mgr.listCameras(), not mgr.list()", async () => {
+  const cameras = [{ serial: "AAA", name: "OBSBOT Tiny 2", status: "available" }];
+  const transport = makeFakeTransport();
+  const mgr = makeFakeMgr(transport, [], cameras);
+  const tools = createTools(mgr);
+  const tool = findTool(tools, "obsbot_devices");
+
+  const result = await tool.handler({});
+
+  expect(mgr.listCameras).toHaveBeenCalledTimes(1);
+  expect(mgr.list).not.toHaveBeenCalled();
+  expect(result).toEqual({ cameras });
+});
+
+test("obsbot_gimbal_move clamps yaw/pitch to conservative limits", async () => {
+  const transport = makeFakeTransport();
+  const mgr = makeFakeMgr(transport);
+  const tools = createTools(mgr);
+  const tool = findTool(tools, "obsbot_gimbal_move");
+
+  const result = await tool.handler({ yaw: 999, pitch: -999, roll: 0 });
+
+  expect(transport.gimbalSet).toHaveBeenCalledTimes(1);
+  expect(transport.gimbalSet).toHaveBeenCalledWith(GIMBAL_YAW_LIMIT_DEG, -90, 0);
+  expect(result).toEqual({ yaw: GIMBAL_YAW_LIMIT_DEG, pitch: -90, roll: 0 });
+});
+
+test("obsbot_ai_track rejects an unknown mode", async () => {
+  const transport = makeFakeTransport();
+  const tools = createTools(makeFakeMgr(transport));
+  await expect(
+    tools.find((t) => t.name === "obsbot_ai_track")!.handler({ enabled: true, mode: "nope" }),
+  ).rejects.toThrow();
+  expect(transport.sendVendor).not.toHaveBeenCalled();
+});
+
+test("obsbot_zoom_vendor clamps ratio and speed", async () => {
+  const transport = makeFakeTransport();
+  const tools = createTools(makeFakeMgr(transport));
+  const result = await tools.find((t) => t.name === "obsbot_zoom_vendor")!.handler({
+    ratio: 9,
+    speed: 999,
+  });
+  expect(transport.sendVendor).toHaveBeenCalledTimes(1);
+  expect(result).toEqual({ ok: true, ratio: 2.0, speed: 255 });
+});
+
+test("obsbot_image_fov sends a 60-byte payload to XU selector 6", async () => {
+  const transport = makeFakeTransport();
+  const tools = createTools(makeFakeMgr(transport));
+  await tools.find((t) => t.name === "obsbot_image_fov")!.handler({ fov: "narrow" });
+  expect(transport.xuRaw).toHaveBeenCalledTimes(1);
+  const [selector, data] = transport.xuRaw.mock.calls[0];
+  expect(selector).toBe(6);
+  expect(data.length).toBe(60);
+  expect([...data.subarray(0, 3)]).toEqual([0x04, 0x01, 2]);
+});
+
+test("obsbot_image_hdr sends [0x01,0x01,on] to XU selector 6", async () => {
+  const transport = makeFakeTransport();
+  const tools = createTools(makeFakeMgr(transport));
+  await tools.find((t) => t.name === "obsbot_image_hdr")!.handler({ enabled: true });
+  const [selector, data] = transport.xuRaw.mock.calls[0];
+  expect(selector).toBe(6);
+  expect([...data.subarray(0, 3)]).toEqual([0x01, 0x01, 1]);
+});
+
+test("obsbot_focus_manual maps 0-100 onto the device range via camCtrl", async () => {
+  const transport = makeFakeTransport();
+  transport.camCtrlRange = vi.fn(async () => ({ min: 0, max: 200 }));
+  const tools = createTools(makeFakeMgr(transport));
+  const result = await tools.find((t) => t.name === "obsbot_focus_manual")!.handler({
+    position: 50,
+  });
+  expect(transport.camCtrlRange).toHaveBeenCalledWith(6);
+  expect(transport.camCtrlSet).toHaveBeenCalledWith(6, 100, 2); // 50% of [0,200], manual flag
+  expect(result).toEqual({ ok: true, mode: "manual", position: 50, value: 100 });
+});
+
+test("obsbot_focus_auto uses the auto flag without querying range", async () => {
+  const transport = makeFakeTransport();
+  const tools = createTools(makeFakeMgr(transport));
+  const result = await tools.find((t) => t.name === "obsbot_focus_auto")!.handler({});
+  expect(transport.camCtrlSet).toHaveBeenCalledWith(6, 0, 1);
+  expect(transport.camCtrlRange).not.toHaveBeenCalled();
+  expect(result).toEqual({ ok: true, mode: "auto" });
+});
+
+test("obsbot_image_wb_manual clamps Kelvin to device range via procAmp", async () => {
+  const transport = makeFakeTransport();
+  transport.procAmpRange = vi.fn(async () => ({ min: 2800, max: 6500 }));
+  const tools = createTools(makeFakeMgr(transport));
+  const result = await tools.find((t) => t.name === "obsbot_image_wb_manual")!.handler({
+    temperature: 9000,
+  });
+  expect(transport.procAmpSet).toHaveBeenCalledWith(7, 6500, 2); // clamped to max, manual flag
+  expect(result).toEqual({ ok: true, mode: "manual", temperature: 6500 });
+});
+
+test("obsbot_image_wb_auto uses the auto flag", async () => {
+  const transport = makeFakeTransport();
+  transport.procAmpRange = vi.fn(async () => ({ min: 2800, max: 6500 }));
+  const tools = createTools(makeFakeMgr(transport));
+  const result = await tools.find((t) => t.name === "obsbot_image_wb_auto")!.handler({});
+  expect(transport.procAmpSet).toHaveBeenCalledWith(7, 2800, 1);
+  expect(result).toEqual({ ok: true, mode: "auto" });
+});
+
+// --- UVC image controls (standard IAMVideoProcAmp) + exposure (IAMCameraControl) ---
+test("obsbot_image_adjust maps 0-100 onto the device range and sets via procAmp (brightness=prop 0)", async () => {
+  const transport = makeFakeTransport();
+  transport.procAmpRange = vi.fn(async () => ({ min: 0, max: 100 }));
+  const tools = createTools(makeFakeMgr(transport));
+  const result = await tools
+    .find((t) => t.name === "obsbot_image_adjust")!
+    .handler({ control: "brightness", level: 75 });
+  expect(transport.procAmpRange).toHaveBeenCalledWith(0);
+  expect(transport.procAmpSet).toHaveBeenCalledWith(0, 75, 2); // 75% of [0,100], manual flag
+  expect(result).toEqual({ ok: true, control: "brightness", level: 75, value: 75 });
+});
+
+test("obsbot_image_adjust uses the right property id + range for gain (prop 9)", async () => {
+  const transport = makeFakeTransport();
+  transport.procAmpRange = vi.fn(async () => ({ min: 1, max: 64 }));
+  const tools = createTools(makeFakeMgr(transport));
+  const result = await tools
+    .find((t) => t.name === "obsbot_image_adjust")!
+    .handler({ control: "gain", level: 50 });
+  expect(transport.procAmpRange).toHaveBeenCalledWith(9);
+  expect(transport.procAmpSet).toHaveBeenCalledWith(9, 33, 2); // 50% of [1,64] -> 32.5 -> 33
+  expect(result).toEqual({ ok: true, control: "gain", level: 50, value: 33 });
+});
+
+test("obsbot_image_adjust rejects an unsupported control via zod", async () => {
+  const transport = makeFakeTransport();
+  const tools = createTools(makeFakeMgr(transport));
+  await expect(
+    tools.find((t) => t.name === "obsbot_image_adjust")!.handler({ control: "gamma", level: 50 }),
+  ).rejects.toThrow();
+});
+
+test("obsbot_image_exposure_auto uses V3 frame protocol, not camCtrl", async () => {
+  const transport = makeFakeTransport();
+  const tools = createTools(makeFakeMgr(transport));
+  const result = await tools.find((t) => t.name === "obsbot_image_exposure_auto")!.handler({});
+  // Exposure now uses vendor V3 frames (CAM_SET_EXPOSURE_MODE) not UVC camCtrl
+  expect(transport.sendVendor).toHaveBeenCalledTimes(1);
+  expect(transport.camCtrlSet).not.toHaveBeenCalled();
+  expect(transport.camCtrlRange).not.toHaveBeenCalled();
+  expect(result).toEqual({ ok: true, mode: "auto" });
+});
+
+test("obsbot_image_exposure_auto with priority:face sends the AE mode frame then a sel-6 face-AE write [03 01 01]", async () => {
+  const transport = makeFakeTransport();
+  const tools = createTools(makeFakeMgr(transport));
+  const result = await tools
+    .find((t) => t.name === "obsbot_image_exposure_auto")!
+    .handler({ priority: "face" });
+  expect(transport.sendVendor).toHaveBeenCalledTimes(1); // AE mode frame
+  const [selector, data] = transport.xuRaw.mock.calls[0];
+  expect(selector).toBe(6);
+  expect([...data.subarray(0, 3)]).toEqual([0x03, 0x01, 0x01]);
+  expect(result).toMatchObject({ ok: true, mode: "auto", priority: "face" });
+});
+
+test("obsbot_image_exposure_auto with priority:global writes [03 01 00]", async () => {
+  const transport = makeFakeTransport();
+  const tools = createTools(makeFakeMgr(transport));
+  await tools
+    .find((t) => t.name === "obsbot_image_exposure_auto")!
+    .handler({ priority: "global" });
+  const [, data] = transport.xuRaw.mock.calls[0];
+  expect([...data.subarray(0, 3)]).toEqual([0x03, 0x01, 0x00]);
+});
+
+test("obsbot_image_exposure_auto without priority does not write face-AE", async () => {
+  const transport = makeFakeTransport();
+  const tools = createTools(makeFakeMgr(transport));
+  await tools.find((t) => t.name === "obsbot_image_exposure_auto")!.handler({});
+  expect(transport.xuRaw).not.toHaveBeenCalled();
+});
+
+test("obsbot_image_exposure_manual sends ONE V3 frame carrying mode and value", async () => {
+  const transport = makeFakeTransport();
+  const tools = createTools(makeFakeMgr(transport));
+  const result = await tools
+    .find((t) => t.name === "obsbot_image_exposure_manual")!
+    .handler({ level: 25 });
+  // ONE sendVendor call. The combined tool previously asserted two — a mode
+  // command followed by a value command — which encoded the bug: CAM_SET_EXPOSURE_MODE
+  // is inert on this device, and the 4-byte value payload was silently discarded, so
+  // neither call did anything. CAM_SET_EXPOSURE_TINY2 with a 5-byte [mode][value]
+  // payload sets both at once. Hardware-verified 2026-07-20.
+  expect(transport.sendVendor).toHaveBeenCalledTimes(1);
+  expect(transport.camCtrlRange).not.toHaveBeenCalled();
+  expect(transport.camCtrlSet).not.toHaveBeenCalled();
+  // 25% of the device's real 1..2500 range => 626. The old 0..65535 figure came
+  // from the Tiny4Linux reference and does not match this hardware; the device
+  // reports its range as 1..2500 via CAM_GET_EXPOSURE_RANGE_TINY2.
+  expect(result).toEqual({ ok: true, mode: "manual", level: 25, raw: 626 });
+});
+
+test("image_exposure_manual forwards its level; image_exposure_auto forwards priority", async () => {
+  const transport = makeFakeTransport();
+  const tools = createTools(makeFakeMgr(transport));
+  await tools.find((t) => t.name === "obsbot_image_exposure_manual")!.handler({ level: 25 });
+  await tools.find((t) => t.name === "obsbot_image_exposure_auto")!.handler({ priority: "face" });
+  expect(transport.sendVendor).toHaveBeenCalled();
+  expect(transport.xuRaw).toHaveBeenCalled(); // face priority => uvcExt write
+});
+
+// --- String-encoded args from clients that ignore the advertised schema ----
+test("obsbot_gimbal_move accepts string-encoded numbers", async () => {
+  const transport = makeFakeTransport();
+  const tools = createTools(makeFakeMgr(transport));
+  const result = await tools
+    .find((t) => t.name === "obsbot_gimbal_move")!
+    .handler({ yaw: "30", pitch: "-20", roll: "0" });
+  expect(transport.gimbalSet).toHaveBeenCalledTimes(1);
+  expect(transport.gimbalSet).toHaveBeenCalledWith(30, -20, 0);
+  expect(result).toEqual({ yaw: 30, pitch: -20, roll: 0 });
+});
+
+test("obsbot_zoom_vendor accepts string-encoded ratio/speed", async () => {
+  const transport = makeFakeTransport();
+  const tools = createTools(makeFakeMgr(transport));
+  const result = await tools
+    .find((t) => t.name === "obsbot_zoom_vendor")!
+    .handler({ ratio: "1.5", speed: "6" });
+  expect(result).toEqual({ ok: true, ratio: 1.5, speed: 6 });
+});
+
+test("obsbot_ai_track accepts string 'true'/'false' for enabled", async () => {
+  const transport = makeFakeTransport();
+  transport.recvStatus = vi.fn(async () => aiStatusBlock(2, 0)); // awake + normal, so verify settles fast
+  const tools = createTools(makeFakeMgr(transport));
+  const on = await tools
+    .find((t) => t.name === "obsbot_ai_track")!
+    .handler({ enabled: "true", mode: "normal" });
+  expect(on).toMatchObject({ ok: true, enabled: true, mode: "normal" });
+
+  transport.recvStatus = vi.fn(async () => aiStatusBlock(0, 0)); // no-tracking, verify target for disable
+  const off = await tools
+    .find((t) => t.name === "obsbot_ai_track")!
+    .handler({ enabled: "false" });
+  expect(off).toMatchObject({ ok: true, enabled: false, mode: "normal" });
+});
+
+test("boolean coercion does NOT treat arbitrary strings as true", async () => {
+  const transport = makeFakeTransport();
+  const tools = createTools(makeFakeMgr(transport));
+  await expect(
+    tools.find((t) => t.name === "obsbot_image_hdr")!.handler({ enabled: "yes" }),
+  ).rejects.toThrow();
+  expect(transport.xuRaw).not.toHaveBeenCalled();
+});
+
+test("obsbot_capture_snapshot returns an image content block on success", async () => {
+  const transport = makeFakeTransport();
+  const tools = createTools(makeFakeMgr(transport));
+  const result = (await tools
+    .find((t) => t.name === "obsbot_capture_snapshot")!
+    .handler({})) as { content: Array<Record<string, unknown>> };
+  expect(transport.snapshot).toHaveBeenCalledTimes(1);
+  const image = result.content.find((c) => c.type === "image");
+  expect(image).toMatchObject({ type: "image", data: "QUJD", mimeType: "image/jpeg" });
+  const text = result.content.find((c) => c.type === "text") as { text: string };
+  expect(JSON.parse(text.text)).toEqual({ width: 1280, height: 720, source: "device" });
+});
+
+// The ceiling was 5000, which happened to be almost exactly what NDI Webcam Input
+// needs to hand over its first frame (measured 4-5s). That made the single value
+// that worked also the largest one permitted — a caller who hit a black frame had
+// nowhere left to go. The headroom above the slowest known source is the point,
+// so pin it rather than let it drift back down.
+test("snapshot settleMs allows well past the slowest known source, and still has a bound", async () => {
+  const transport = makeFakeTransport();
+  const tool = findTool(createTools(makeFakeMgr(transport)), "obsbot_capture_snapshot");
+  await tool.handler({ settleMs: 15000 });
+  expect(transport.snapshot).toHaveBeenCalledWith(
+    expect.objectContaining({ settleMs: 15000 }),
+  );
+  await expect(tool.handler({ settleMs: 15001 })).rejects.toThrow();
+});
+
+test("obsbot_capture_snapshot returns actionable text (no image) when the camera is busy", async () => {
+  const transport = makeFakeTransport();
+  transport.snapshot = vi.fn(async () => {
+    throw new CameraBusyError();
+  });
+  const tools = createTools(makeFakeMgr(transport));
+  const result = (await tools
+    .find((t) => t.name === "obsbot_capture_snapshot")!
+    .handler({})) as { content: Array<Record<string, unknown>> };
+  expect(result.content.some((c) => c.type === "image")).toBe(false);
+  const text = result.content.find((c) => c.type === "text") as { text: string };
+  expect(text.text).toMatch(/in use/i);
+});
+
+test("obsbot_capture_snapshot source 'virtual' resolves a device path and passes it through", async () => {
+  const transport = makeFakeTransport();
+  const mgr = makeFakeMgr(transport, [
+    { path: "p-tiny", name: "OBSBOT Tiny 2 StreamCamera" },
+    { path: "p-virt", name: "OBSBOT Virtual Camera" },
+  ]);
+  const tools = createTools(mgr);
+  await tools.find((t) => t.name === "obsbot_capture_snapshot")!.handler({ source: "virtual" });
+  expect(transport.snapshot).toHaveBeenCalledWith(
+    expect.objectContaining({ path: "p-virt" }),
+  );
+});
+
+test("obsbot_capture_snapshot returns text (no image) when the requested source is absent", async () => {
+  const transport = makeFakeTransport();
+  const mgr = makeFakeMgr(transport, [{ path: "p-tiny", name: "OBSBOT Tiny 2 StreamCamera" }]);
+  const tools = createTools(mgr);
+  const result = (await tools
+    .find((t) => t.name === "obsbot_capture_snapshot")!
+    .handler({ source: "ndi" })) as { content: Array<Record<string, unknown>> };
+  expect(transport.snapshot).not.toHaveBeenCalled();
+  expect(result.content.some((c) => c.type === "image")).toBe(false);
+});
+
+test("obsbot_capture_record returns the session and output path", async () => {
+  const transport = makeFakeTransport();
+  const capture = makeFakeCapture();
+  const tools = createTools(makeFakeMgr(transport), capture);
+  const result = await tools.find((t) => t.name === "obsbot_capture_record")!.handler({ durationSec: 10 });
+  expect(capture.startRecord).toHaveBeenCalledWith(
+    expect.objectContaining({ durationSec: 10, audio: true, source: "device" }),
+  );
+  expect(result).toMatchObject({ ok: true, sessionId: "cap1", outputPath: expect.any(String), durationSec: 3600 });
+});
+
+test("obsbot_capture_record surfaces FfmpegMissingError as actionable text (no throw)", async () => {
+  const transport = makeFakeTransport();
+  const capture = makeFakeCapture({ startRecord: vi.fn(async () => { throw new FfmpegMissingError(); }) });
+  const tools = createTools(makeFakeMgr(transport), capture);
+  const result = (await tools.find((t) => t.name === "obsbot_capture_record")!.handler({})) as { content: Array<Record<string, unknown>> };
+  const text = result.content.find((c) => c.type === "text") as { text: string };
+  expect(text.text).toMatch(/ffmpeg/i);
+});
+
+test("obsbot_capture_record surfaces a CaptureError as text", async () => {
+  const transport = makeFakeTransport();
+  const capture = makeFakeCapture({ startRecord: vi.fn(async () => { throw new CaptureError("no 'ndi' video source found"); }) });
+  const tools = createTools(makeFakeMgr(transport), capture);
+  const result = (await tools.find((t) => t.name === "obsbot_capture_record")!.handler({ source: "ndi" })) as { content: Array<Record<string, unknown>> };
+  const text = result.content.find((c) => c.type === "text") as { text: string };
+  expect(text.text).toMatch(/ndi/i);
+});
+
+test("obsbot_capture_preview returns a session id", async () => {
+  const transport = makeFakeTransport();
+  const capture = makeFakeCapture();
+  const tools = createTools(makeFakeMgr(transport), capture);
+  const result = await tools.find((t) => t.name === "obsbot_capture_preview")!.handler({});
+  expect(result).toEqual({ ok: true, sessionId: "cap2" });
+});
+
+test("obsbot_capture_stop stops the session", async () => {
+  const transport = makeFakeTransport();
+  const capture = makeFakeCapture();
+  const tools = createTools(makeFakeMgr(transport), capture);
+  const result = await tools.find((t) => t.name === "obsbot_capture_stop")!.handler({ sessionId: "cap1" });
+  expect(capture.stop).toHaveBeenCalledWith("cap1");
+  expect(result).toMatchObject({ ok: true, kind: "record", graceful: true });
+});
+
+test("obsbot_capture_list returns active sessions", async () => {
+  const transport = makeFakeTransport();
+  const sessions = [{ id: "cap1", kind: "record", pid: 1, source: "device", startedAtIso: "t" }];
+  const capture = makeFakeCapture({ list: vi.fn(() => sessions as never) });
+  const tools = createTools(makeFakeMgr(transport), capture);
+  const result = await tools.find((t) => t.name === "obsbot_capture_list")!.handler({});
+  expect(result).toEqual({ sessions });
+});
+
+test("obsbot_status decodes awake+hdr from the status block", async () => {
+  const transport = makeFakeTransport();
+  const block = Buffer.alloc(60);
+  block[0x02] = 0; // awake
+  block[0x06] = 1; // hdr on
+  transport.recvStatus = vi.fn(async () => block);
+  const tools = createTools(makeFakeMgr(transport), undefined, true); // debug: raw present
+  const tool = findTool(tools, "obsbot_status");
+  const result = await tool.handler({});
+  expect(transport.recvStatus).toHaveBeenCalledTimes(1);
+  expect(result).toMatchObject({
+    ok: true,
+    awake: true,
+    hdr: true,
+    aiMode: "no-tracking",
+    trackSpeed: "standard",
+  });
+  // raw exposes the full 60-byte block as hex (120 chars) for RE of undecoded offsets.
+  expect(result.raw).toHaveLength(120);
+  expect(result.raw.slice(0x06 * 2, 0x06 * 2 + 2)).toBe("01"); // byte 0x06 = hdr on
+});
+
+// --- Debug gating: obsbot_debug_probe and status.raw are RE-only, behind --debug. ---
+test("createTools omits obsbot_debug_probe unless debug is enabled", () => {
+  const tools = createTools(makeFakeMgr());
+  expect(tools.find((t) => t.name === "obsbot_debug_probe")).toBeUndefined();
+});
+
+test("createTools includes obsbot_debug_probe when debug is enabled", () => {
+  const tools = createTools(makeFakeMgr(), undefined, true);
+  expect(tools.find((t) => t.name === "obsbot_debug_probe")).toBeDefined();
+});
+
+// Hard break: obsbot_probe was renamed obsbot_debug_probe with no alias — the old
+// name must never resolve, under --debug or otherwise.
+test("obsbot_probe is renamed obsbot_debug_probe (old name gone even under debug)", () => {
+  const names = createTools(makeFakeMgr(), undefined, true)
+    .map((t) => t.name);
+  expect(names).toContain("obsbot_debug_probe");
+  expect(names).not.toContain("obsbot_probe");
+});
+
+// --- obsbot_debug_probe: the mailbox reply is not instant. ---
+// The device populates the reply mailbox tens of ms after the request; on real
+// hardware 2026-07-21 it landed 30-60ms out. A poll loop with NO delay between
+// reads drains all 8 attempts in ~7ms and reports "no valid reply" for a command
+// the device answered perfectly well. This is the same bug f27956f fixed in
+// transport/read-serial.ts, which was never backported to the probe.
+//
+// Every other probe test uses a fake that answers instantly, which is exactly why
+// the bug survived them — so this fake models the LATENCY, not just the protocol.
+function makeLatentProbeTransport(latencyMs: number, wireCmd = 0x0104) {
+  const t = makeFakeTransport();
+  let sentAt: number | undefined;
+  let sentSeq = 0;
+  t.xuRaw = vi.fn(async (_selector: number, data: Buffer) => {
+    sentSeq = data.readUInt16LE(2);
+    sentAt = Date.now();
+  });
+  t.xuGetRaw = vi.fn(async (_selector: number, _length: number) => {
+    // Before the reply lands the mailbox holds nothing useful.
+    if (sentAt === undefined || Date.now() - sentAt < latencyMs) return Buffer.alloc(60);
+    return buildFrame({
+      seq: sentSeq,
+      cmd: wireCmd,
+      receiver: 0x0a,
+      sender: 0x04,
+      payload: Buffer.from("beef", "hex"),
+    });
+  });
+  return t;
+}
+
+test("obsbot_debug_probe waits for a reply that arrives at the device's real latency", async () => {
+  const transport = makeLatentProbeTransport(50);
+  const tools = createTools(makeFakeMgr(transport), undefined, true);
+  const probe = tools.find((t) => t.name === "obsbot_debug_probe")!;
+
+  const result = (await probe.handler({
+    mode: "query",
+    opcode: "AI_GET_QUICK_STATUS",
+  })) as { ok: boolean; parsed?: { payloadHex: string } };
+
+  expect(result.ok).toBe(true);
+  expect(result.parsed?.payloadHex).toBe("beef");
+});
+
+test("obsbot_debug_probe still gives up when the device truly never answers", async () => {
+  // The delay must not turn a real "no reply" into a hang or a false positive.
+  const transport = makeLatentProbeTransport(60_000);
+  const tools = createTools(makeFakeMgr(transport), undefined, true);
+  const probe = tools.find((t) => t.name === "obsbot_debug_probe")!;
+
+  const result = (await probe.handler({
+    mode: "query",
+    opcode: "AI_GET_QUICK_STATUS",
+  })) as { ok: boolean; error?: string };
+
+  expect(result.ok).toBe(false);
+  expect(result.error).toMatch(/no valid reply/);
+});
+
+// Focus is a standard UVC control, NOT part of the 60-byte vendor status block, so
+// it takes a second read to report. It is worth the read: obsbot_focus_auto and
+// obsbot_focus_manual were write-only, and the only way to answer "is it still in
+// autofocus?" was to bypass the tool surface entirely and call camctrl_get on the
+// helper by hand.
+// Under autofocus this camera echoes the last written value instead of exposing the
+// motor -- MEASURED 2026-07-25, it stayed pinned across a 40deg pan, a 3.34x->1x zoom
+// and 9s of settling. Publishing that would read as a live focus distance while being
+// a stale write, so the field is withheld and the caller can tell the difference.
+test("obsbot_status reports autofocus WITHOUT a position, which the camera cannot supply", async () => {
+  const transport = makeFakeTransport();
+  transport.camCtrlGet = vi.fn(async (_p: number) => ({ value: 120, flags: 1 })); // 1 = auto
+  const result = await findTool(createTools(makeFakeMgr(transport)), "obsbot_status").handler({});
+  expect(result).toMatchObject({ ok: true, focusMode: "auto" });
+  expect(result).not.toHaveProperty("focusPosition");
+});
+
+// In manual mode the value IS the setpoint, and round-trips exactly, so it is worth
+// reporting -- on the same 0-100 scale obsbot_focus_manual accepts, whatever the
+// device's own range happens to be.
+test("obsbot_status reports the manual focus setpoint, normalised to 0-100", async () => {
+  const transport = makeFakeTransport();
+  transport.camCtrlRange = vi.fn(async (_p: number) => ({ min: 0, max: 200 }));
+  transport.camCtrlGet = vi.fn(async (_p: number) => ({ value: 50, flags: 2 })); // 2 = manual
+  const result = await findTool(createTools(makeFakeMgr(transport)), "obsbot_status").handler({});
+  expect(result).toMatchObject({ ok: true, focusMode: "manual", focusPosition: 25 });
+});
+
+// A focus flags value we don't recognise is reported as unknown rather than guessed
+// at — the same rule the FOV and AI-mode decodes already follow.
+test("obsbot_status calls an unrecognised focus mode unknown rather than guessing", async () => {
+  const transport = makeFakeTransport();
+  transport.camCtrlGet = vi.fn(async (_p: number) => ({ value: 10, flags: 7 }));
+  const result = await findTool(createTools(makeFakeMgr(transport)), "obsbot_status").handler({});
+  expect(result).toMatchObject({ ok: true, focusMode: "unknown" });
+});
+
+// The status BLOCK is the point of this tool; focus is a bonus. A device or platform
+// that cannot answer the focus query must not take the whole status read down with
+// it — losing awake/aiMode/zoomPercent to learn nothing about focus is a bad trade.
+test("obsbot_status still returns the status block when the focus read fails", async () => {
+  const transport = makeFakeTransport();
+  transport.camCtrlGet = vi.fn(async (_p: number) => {
+    throw new Error("control not supported on this device");
+  });
+  const result = await findTool(createTools(makeFakeMgr(transport)), "obsbot_status").handler({});
+  expect(result).toMatchObject({ ok: true, aiMode: "no-tracking", focusMode: "unknown" });
+  expect(result).not.toHaveProperty("focusPosition");
+});
+
+test("obsbot_status omits the raw RE block unless debug is enabled", async () => {
+  const transport = makeFakeTransport();
+  const block = Buffer.alloc(60);
+  block[0x02] = 0; // awake
+  transport.recvStatus = vi.fn(async () => block);
+  const tools = createTools(makeFakeMgr(transport));
+  const result = await findTool(tools, "obsbot_status").handler({});
+  expect(result).toMatchObject({ ok: true, awake: true });
+  expect(result.raw).toBeUndefined();
+});
+
+test("obsbot_status includes the raw block when debug is enabled", async () => {
+  const transport = makeFakeTransport();
+  const block = Buffer.alloc(60);
+  block[0x02] = 0; // awake
+  transport.recvStatus = vi.fn(async () => block);
+  const tools = createTools(makeFakeMgr(transport), undefined, true);
+  const result = await findTool(tools, "obsbot_status").handler({});
+  expect(result.raw).toHaveLength(120);
+});
+
+test("obsbot_debug_probe get reads the given selector/length via xuGetRaw", async () => {
+  const transport = makeFakeTransport();
+  transport.xuGetRaw = vi.fn(async () => Buffer.from("aabbcc", "hex"));
+  const tools = createTools(makeFakeMgr(transport), undefined, true);
+  const tool = findTool(tools, "obsbot_debug_probe");
+  const result = await tool.handler({ mode: "get", selector: 6, length: 128 });
+  expect(transport.xuGetRaw).toHaveBeenCalledWith(6, 128);
+  expect(result).toMatchObject({ ok: true, selector: 6, len: 3, raw: "aabbcc" });
+});
+
+test("obsbot_debug_probe set writes raw hex to the selector via xuRaw", async () => {
+  const transport = makeFakeTransport();
+  const tools = createTools(makeFakeMgr(transport), undefined, true);
+  const tool = findTool(tools, "obsbot_debug_probe");
+  const result = await tool.handler({ mode: "set", selector: 2, hex: "aa25" });
+  expect(transport.xuRaw).toHaveBeenCalledWith(2, Buffer.from("aa25", "hex"));
+  expect(result).toMatchObject({ ok: true, selector: 2, sent: "aa25" });
+});
+
+// AI_GET_QUICK_STATUS wireCmd/receiver, from src/codec/opcodes.ts — used to build
+// fixture reply frames below.
+const AI_GET_QUICK_STATUS_CMD = 0x0104;
+const AI_GET_QUICK_STATUS_RECEIVER = 0x04;
+
+test("obsbot_debug_probe query with no payload sends the 0x01 GET flavour, not 0x25", async () => {
+  const transport = makeFakeTransport();
+  const tools = createTools(makeFakeMgr(transport), undefined, true);
+  const tool = findTool(tools, "obsbot_debug_probe");
+  await tool.handler({ mode: "query", opcode: "AI_GET_QUICK_STATUS" });
+  expect(transport.xuRaw).toHaveBeenCalledTimes(1);
+  const sent: Buffer = (transport.xuRaw as ReturnType<typeof vi.fn>).mock.calls[0][1];
+  expect(sent[1]).toBe(0x01); // GET flavour (encodeVendorGet), not 0x25
+});
+
+test("obsbot_debug_probe query with a payloadHex sends the 0x25 SET flavour", async () => {
+  const transport = makeFakeTransport();
+  const tools = createTools(makeFakeMgr(transport), undefined, true);
+  const tool = findTool(tools, "obsbot_debug_probe");
+  await tool.handler({ mode: "query", opcode: "AI_GET_QUICK_STATUS", payloadHex: "01020304" });
+  const sent: Buffer = (transport.xuRaw as ReturnType<typeof vi.fn>).mock.calls[0][1];
+  expect(sent[1]).toBe(0x25); // SET flavour (encodeVendorProbe) — a real nested payload
+});
+
+test("obsbot_debug_probe query ignores a stale/mismatched reply and keeps polling until the matching one lands", async () => {
+  const transport = makeFakeTransport();
+  const staleReply = buildFrame({ seq: 999, cmd: AI_GET_QUICK_STATUS_CMD, receiver: AI_GET_QUICK_STATUS_RECEIVER, payload: Buffer.alloc(0) });
+  let call = 0;
+  transport.xuGetRaw = vi.fn(async () => {
+    call += 1;
+    if (call < 3) return staleReply; // wrong seq — the mailbox's previous reply
+    // seq 1 is what nextSeq() hands out on this transport's first call.
+    return buildFrame({ seq: 1, cmd: AI_GET_QUICK_STATUS_CMD, receiver: AI_GET_QUICK_STATUS_RECEIVER, payload: Buffer.from("aabb", "hex") });
+  });
+  const tools = createTools(makeFakeMgr(transport), undefined, true);
+  const tool = findTool(tools, "obsbot_debug_probe");
+  const result = await tool.handler({ mode: "query", opcode: "AI_GET_QUICK_STATUS" });
+  expect(transport.xuGetRaw).toHaveBeenCalledTimes(3);
+  expect(result).toMatchObject({
+    ok: true,
+    opcode: "AI_GET_QUICK_STATUS",
+    parsed: { cmd: "0x0104", receiver: AI_GET_QUICK_STATUS_RECEIVER, payloadHex: "aabb" },
+  });
+});
+
+test("obsbot_debug_probe query returns ok:false when no valid reply arrives within the poll budget", async () => {
+  const transport = makeFakeTransport();
+  transport.xuGetRaw = vi.fn(async () => Buffer.alloc(60)); // never parses (bad magic)
+  const tools = createTools(makeFakeMgr(transport), undefined, true);
+  const tool = findTool(tools, "obsbot_debug_probe");
+  const result = await tool.handler({ mode: "query", opcode: "AI_GET_QUICK_STATUS" });
+  expect(result).toMatchObject({ ok: false, error: expect.stringMatching(/no valid reply/i) });
+  // Bounded retry, not a single read and not unbounded polling.
+  expect((transport.xuGetRaw as ReturnType<typeof vi.fn>).mock.calls.length).toBeGreaterThan(1);
+});
+
+// --- Preset read path: flat XU selectors 12 (list) + 13 (entry cursor). ---
+// Real captured fixtures from hardware (2026-07-19 session) — see preset.test.ts
+// for the byte-layout tests these mirror.
+// A realistic 60-byte selector-12 reply representing "zero presets saved" — count=0
+// (byte 0), but NOT bit-for-bit identical to a failed/silent read: real hardware has
+// not captured this exact state, so the nonzero sentinel byte just keeps this fixture
+// distinguishable from the "totally zeroed" hostile-input fixture that
+// implausiblePresetListReason must reject (see preset.ts's C1 design note — an
+// all-zero response is treated as a failed read, not as "genuinely zero presets").
+// A genuinely empty device returns a BIT-FOR-BIT ALL-ZERO selector-12 block
+// (hardware-established 2026-07-19, OBSBOT Center closed, camera measured awake,
+// stable across repeated reads). This fixture previously set b[40] = 0xaa — a byte
+// invented so the C1 plausibility check would pass. That fiction is exactly what let
+// the empty-state dead-end ship: it asserted an empty device is distinguishable from
+// a failed read by the block alone, which the hardware disproves. Emptiness is now
+// established by corroborating with the status block instead.
+function emptyPresetListBlock(): Buffer {
+  return Buffer.alloc(60);
+}
+
+const PRESET_LIST_BLOCK = Buffer.from("030001020000", "hex");
+const PRESET_ENTRY_1 = Buffer.from("0000000018fcfce5640055484a6c633256304d513d3d00", "hex");
+const PRESET_ENTRY_2 = Buffer.from("0001000046004808640055484a6c633256304d673d3d00", "hex");
+const PRESET_ENTRY_3 = Buffer.from("000200003c004808640055484a6c633256304d773d3d00", "hex");
+const PRESET_ENTRY_END = Buffer.from("02000000", "hex");
+
+function makePresetTransport() {
+  const transport = makeFakeTransport();
+  const calls: string[] = [];
+  let entryCall = 0;
+  const entries = [PRESET_ENTRY_1, PRESET_ENTRY_2, PRESET_ENTRY_3, PRESET_ENTRY_END];
+  transport.xuGetRaw = vi.fn(async (selector: number, _length: number) => {
+    if (selector === 12) {
+      calls.push("get12");
+      return PRESET_LIST_BLOCK;
+    }
+    calls.push("get13");
+    return entries[entryCall++];
+  });
+  transport.xuRaw = vi.fn(async (selector: number, _data: Buffer) => {
+    if (selector === 12) calls.push("reset12");
+  });
+  return { transport, calls };
+}
+
+test("obsbot_preset_list reads list block, echo-resets the cursor, then walks entries", async () => {
+  const { transport, calls } = makePresetTransport();
+  const tools = createTools(makeFakeMgr(transport));
+  const tool = findTool(tools, "obsbot_preset_list");
+
+  const result = await tool.handler({});
+
+  expect(result).toMatchObject({ ok: true });
+  const slots = (result as { slots: Array<Record<string, unknown>> }).slots;
+  expect(slots).toHaveLength(3);
+  expect(slots.every((s) => s.occupied)).toBe(true);
+  expect(slots.map((s) => s.name)).toEqual(["Preset1", "Preset2", "Preset3"]);
+  expect(slots[0].pose).toEqual({ pan: -66.6, tilt: -10, roll: 0, zoom: 1 });
+
+  // The echo-write reset is load-bearing: without it the cursor stays exhausted
+  // and enumeration returns nothing. Must happen after the list read and before
+  // any selector-13 reads.
+  expect(calls).toEqual(["get12", "reset12", "get13", "get13", "get13"]);
+  expect(transport.xuRaw).toHaveBeenCalledWith(12, PRESET_LIST_BLOCK);
+});
+
+// --- C1: never echo an implausible selector-12 read back to the device ---
+
+test("C1: an all-zero selector-12 block is rejected before the echo-write, not trusted as 'empty'", async () => {
+  // An all-zero block alone proves nothing — a genuinely empty device returns the
+  // same bytes. What marks THIS as a dead read is that the status block is zeroed
+  // too: a dead link / stale handle zeroes both, so there is no corroboration and
+  // the block must never be trusted or echoed.
+  const transport = makeFakeTransport();
+  transport.xuGetRaw = vi.fn(async (selector: number) =>
+    selector === 12 ? Buffer.alloc(60) : Buffer.alloc(60),
+  );
+  transport.recvStatus = vi.fn(async () => Buffer.alloc(60));
+  const tools = createTools(makeFakeMgr(transport));
+  const tool = findTool(tools, "obsbot_preset_list");
+
+  const result = await tool.handler({});
+
+  expect(result).toMatchObject({ ok: false });
+  expect((result as { error: string }).error).toMatch(/implausible|all-zero/i);
+  // The load-bearing guarantee: an untrusted read must never be echoed back to
+  // selector 12 (its write semantics for anything but a genuine echo are undecoded).
+  expect(transport.xuRaw).not.toHaveBeenCalled();
+});
+
+test("C1: an oversized count (>3) on selector 12 is rejected before the echo-write", async () => {
+  const transport = makeFakeTransport();
+  const block = Buffer.alloc(60);
+  block[0] = 0xff; // garbage count
+  transport.xuGetRaw = vi.fn(async () => block);
+  const tools = createTools(makeFakeMgr(transport));
+  const tool = findTool(tools, "obsbot_preset_list");
+
+  const result = await tool.handler({});
+
+  expect(result).toMatchObject({ ok: false });
+  expect((result as { error: string }).error).toMatch(/implausible|count/i);
+  expect(transport.xuRaw).not.toHaveBeenCalled();
+});
+
+test("C1: a short (truncated) selector-12 read is rejected before the echo-write", async () => {
+  const transport = makeFakeTransport();
+  // count=2 claims 2 slot-index bytes follow, but the buffer is cut short.
+  transport.xuGetRaw = vi.fn(async () => Buffer.from("02", "hex"));
+  const tools = createTools(makeFakeMgr(transport));
+  const tool = findTool(tools, "obsbot_preset_list");
+
+  const result = await tool.handler({});
+
+  expect(result).toMatchObject({ ok: false });
+  expect(transport.xuRaw).not.toHaveBeenCalled();
+});
+
+test("a corroborated empty device reports three empty slots and is NOT echoed back", async () => {
+  // Supersedes the old "count=0 but non-all-zero block IS echoed" case: hardware has
+  // no such block. A real empty device returns all zeros, is accepted only because
+  // the status block corroborates, and needs no cursor reset — so no echo-write.
+  const transport = makeFakeTransport();
+  transport.xuGetRaw = vi.fn(async () => emptyPresetListBlock());
+  const tools = createTools(makeFakeMgr(transport));
+  const tool = findTool(tools, "obsbot_preset_list");
+
+  const result = await tool.handler({});
+
+  expect(result).toMatchObject({ ok: true });
+  expect((result as { slots: Array<{ occupied: boolean }> }).slots.every((s) => !s.occupied)).toBe(true);
+  expect(transport.xuRaw).not.toHaveBeenCalled();
+});
+
+// --- I1: cross-check the entry-cursor walk against selector 12's own slot list ---
+
+test("I1: cursor-exhausts-early vs list disagreement fails loudly instead of under-reporting", async () => {
+  const transport = makeFakeTransport();
+  // selector 12 claims 3 occupied slots, but the entry cursor (selector 13) hits the
+  // exhausted marker after only 1 — a real device inconsistency, not a decode bug.
+  // Cycle the entries so the SAME inconsistency is presented on every retry attempt -
+  // a persistent device inconsistency, not a one-off that a re-read would clear.
+  let entryCall = 0;
+  const entries = [PRESET_ENTRY_1, PRESET_ENTRY_END];
+  transport.xuGetRaw = vi.fn(async (selector: number) =>
+    selector === 12 ? PRESET_LIST_BLOCK : entries[entryCall++ % entries.length],
+  );
+  const tools = createTools(makeFakeMgr(transport));
+  const tool = findTool(tools, "obsbot_preset_list");
+
+  const result = await tool.handler({});
+
+  expect(result).toMatchObject({ ok: false });
+  expect((result as { error: string }).error).toMatch(/mismatch/i);
+});
+
+// --- I3: the entry walk never reads more than the device's 3 slots, and an
+// implausible/all-zero selector-13 entry does not masquerade as an occupied slot ---
+
+test("I3: a garbage oversized count doesn't turn into an unbounded read loop", async () => {
+  const transport = makeFakeTransport();
+  const block = Buffer.alloc(60);
+  block[0] = 0xff; // would mean 255 selector-13 reads if unclamped
+  transport.xuGetRaw = vi.fn(async () => block);
+  const tools = createTools(makeFakeMgr(transport));
+  const tool = findTool(tools, "obsbot_preset_list");
+
+  // C1 already rejects this before the walk even starts - confirms the garbage
+  // count never reaches the entry loop, let alone drives 255 USB transfers. Asserted
+  // as "no selector-13 read ever happens", which is the actual invariant; a raw call
+  // count would just be measuring how many times the retry policy re-reads.
+  await tool.handler({});
+  const entryReads = transport.xuGetRaw.mock.calls.filter((c) => c[0] === 13);
+  expect(entryReads).toHaveLength(0);
+});
+
+test("I3: an all-zero selector-13 entry does not collapse into a false-occupied slot", async () => {
+  const transport = makeFakeTransport();
+  // selector 12 plausibly claims 1 occupied slot, but the corresponding selector-13
+  // read comes back all zero (a failed/short entry read) instead of a real entry
+  // or the 0x02 exhausted marker.
+  transport.xuGetRaw = vi.fn(async (selector: number) =>
+    selector === 12 ? Buffer.from("0100", "hex") : Buffer.alloc(60),
+  );
+  const tools = createTools(makeFakeMgr(transport));
+  const tool = findTool(tools, "obsbot_preset_list");
+
+  const result = await tool.handler({});
+
+  // The all-zero entry must NOT decode as a plausible occupied slot; since that
+  // disagrees with selector 12's claim, I1's cross-check fails loudly.
+  expect(result).toMatchObject({ ok: false });
+});
+
+test("obsbot_gimbal_position maps UVC pan->yaw and negates tilt->pitch", async () => {
+  const transport = makeFakeTransport();
+  // pan (prop 0) = 30 -> yaw 30; tilt (prop 1) = -19 -> pitch +19 (negated)
+  transport.camCtrlGet = vi.fn(async (p: number) =>
+    p === 0 ? { value: 30, flags: 2 } : { value: -19, flags: 2 },
+  );
+  const tools = createTools(makeFakeMgr(transport));
+  const tool = findTool(tools, "obsbot_gimbal_position");
+
+  const result = await tool.handler({});
+
+  expect(transport.camCtrlGet).toHaveBeenCalledWith(0);
+  expect(transport.camCtrlGet).toHaveBeenCalledWith(1);
+  expect(result).toEqual({ yaw: 30, pitch: 19 });
+});
+
+test("obsbot_gimbal_position rounds a long float readout to 2 decimal places", async () => {
+  // Linux/macOS now report the pan/tilt float unrounded (arc-seconds / 3600),
+  // which can produce many more digits than ±1° accuracy justifies.
+  const transport = makeFakeTransport();
+  transport.camCtrlGet = vi.fn(async (p: number) =>
+    p === 0 ? { value: 5.975277777777778, flags: 2 } : { value: -3.001, flags: 2 },
+  );
+  const tools = createTools(makeFakeMgr(transport));
+  const tool = findTool(tools, "obsbot_gimbal_position");
+
+  const result = await tool.handler({});
+
+  expect(result).toEqual({ yaw: 5.98, pitch: 3 });
+});
+
+// --- obsbot_preset_save ---
+
+test("preset slot input schemas advertise the supported Tiny 2 slots to MCP clients", () => {
+  const tools = createTools(makeFakeMgr());
+  for (const name of [
+    "obsbot_preset_save",
+    "obsbot_preset_recall",
+    "obsbot_preset_update",
+    "obsbot_preset_rename",
+    "obsbot_preset_delete",
+  ]) {
+    const schema = z.toJSONSchema(findTool(tools, name).schema, {
+      target: "draft-07",
+      io: "input",
+    });
+    expect(schema.properties?.slot).toMatchObject({
+      type: "integer",
+      enum: [1, 2, 3],
+      minimum: 1,
+      maximum: 3,
+    });
+  }
+});
+
+test("obsbot_preset_save rejects an occupied slot", async () => {
+  // makePresetTransport's fixture has all three slots occupied.
+  const { transport } = makePresetTransport();
+  const tools = createTools(makeFakeMgr(transport));
+  const tool = findTool(tools, "obsbot_preset_save");
+
+  const result = await tool.handler({ slot: 1 });
+
+  expect(result).toEqual({ ok: false, error: "slot 1 is occupied; update or delete first" });
+  expect(transport.sendVendor).not.toHaveBeenCalled();
+});
+
+
+// Models the device as STATE rather than call ordinal: reads reflect whatever the
+// writes have done so far. Call-ordinal fakes ("1st read empty, 2nd read occupied")
+// silently encode HOW MANY times production code reads, so they break the moment a
+// read is added for safety - and worse, they cannot distinguish "we read twice" from
+// "the device changed". State-driven fakes survive both.
+function statefulPresetTransport(before: Buffer, after: Buffer, entry = PRESET_ENTRY_1) {
+  const transport = makeFakeTransport();
+  let written = false;
+  const realSend = transport.sendVendor;
+  transport.sendVendor = vi.fn(async (frame: Buffer) => {
+    written = true;
+    return realSend(frame);
+  });
+  transport.xuGetRaw = vi.fn(async (selector: number) =>
+    selector === 12 ? (written ? after : before) : entry,
+  );
+  transport.xuRaw = vi.fn(async () => {});
+  return transport;
+}
+
+test("obsbot_preset_save on an empty slot sends the ADD frame with the live pose then verifies", async () => {
+  const transport = statefulPresetTransport(emptyPresetListBlock(), Buffer.from("0100", "hex"));
+  // pan (prop 0) = 21 -> yaw 21; tilt (prop 1) = 0 -> pitch -0 (negated)
+  transport.camCtrlGet = vi.fn(async (p: number) =>
+    p === 0 ? { value: 21, flags: 2 } : { value: 0, flags: 2 },
+  );
+  const tools = createTools(makeFakeMgr(transport));
+  const tool = findTool(tools, "obsbot_preset_save");
+
+  const result = await tool.handler({ slot: 1 });
+
+  expect(transport.sendVendor).toHaveBeenCalledTimes(1);
+  const addFrame = transport.sendVendor.mock.calls[0][0] as Buffer;
+  expect(addFrame.subarray(10, 12).toString("hex")).toBe("4439"); // cmd 0x3944 LE
+  expect(addFrame.readFloatLE(20)).toBeCloseTo(21); // pan slotted after idx(4) + pan f32
+
+  expect(result).toMatchObject({ ok: true });
+  const slot = (result as { slot: Record<string, unknown> }).slot;
+  expect(slot).toMatchObject({ slot: 1, occupied: true, name: "Preset1" });
+});
+
+// Helper to build a selector-13 entry buffer matching decodePresetEntry's layout,
+// using the real base64 encoding at runtime (avoids hand-computed hex, which is
+// error-prone). slotIdx is 0-based (slot 1 -> 0).
+function makePresetEntryBuffer(slotIdx: number, name: string): Buffer {
+  const header = Buffer.alloc(10);
+  header[0] = 0x00; // not the ENTRY_END marker (0x02)
+  header[1] = slotIdx;
+  header.writeInt16LE(-1000, 4); // pitch hundredths (arbitrary, unused by these tests)
+  header.writeInt16LE(-6660, 6); // yaw hundredths (arbitrary, unused by these tests)
+  header[8] = 100; // zoom hundredths
+  const b64 = Buffer.from(name, "ascii").toString("base64");
+  return Buffer.concat([header, Buffer.from(b64, "ascii"), Buffer.from([0])]);
+}
+
+// --- obsbot_preset_recall ---
+
+test("obsbot_preset_recall rejects an empty slot", async () => {
+  const transport = makeFakeTransport();
+  transport.xuGetRaw = vi.fn(async (selector: number, _length: number) =>
+    selector === 12 ? emptyPresetListBlock() : Buffer.from("02000000", "hex"),
+  );
+  const tools = createTools(makeFakeMgr(transport));
+  const tool = findTool(tools, "obsbot_preset_recall");
+
+  const result = await tool.handler({ slot: 1 });
+
+  expect(result).toEqual({ ok: false, error: "slot 1 is empty; save first" });
+  expect(transport.sendVendor).not.toHaveBeenCalled();
+});
+
+test("obsbot_preset_recall sends the RECALL frame for an occupied slot then verifies", async () => {
+  const transport = makeFakeTransport();
+  transport.xuGetRaw = vi.fn(async (selector: number, _length: number) =>
+    selector === 12 ? Buffer.from("0100", "hex") : PRESET_ENTRY_1,
+  );
+  transport.xuRaw = vi.fn(async (_selector: number, _data: Buffer) => {});
+  const tools = createTools(makeFakeMgr(transport));
+  const tool = findTool(tools, "obsbot_preset_recall");
+
+  const result = await tool.handler({ slot: 1 });
+
+  expect(transport.sendVendor).toHaveBeenCalledTimes(1);
+  const frame = transport.sendVendor.mock.calls[0][0] as Buffer;
+  expect(frame.subarray(10, 12).toString("hex")).toBe("c439"); // cmd 0x39c4 LE
+  expect(result).toMatchObject({ ok: true });
+  const slot = (result as { slot: Record<string, unknown> }).slot;
+  expect(slot).toMatchObject({ slot: 1, occupied: true, name: "Preset1" });
+});
+
+// --- obsbot_preset_update ---
+
+test("obsbot_preset_update rejects an empty slot", async () => {
+  const transport = makeFakeTransport();
+  transport.xuGetRaw = vi.fn(async (selector: number, _length: number) =>
+    selector === 12 ? emptyPresetListBlock() : Buffer.from("02000000", "hex"),
+  );
+  const tools = createTools(makeFakeMgr(transport));
+  const tool = findTool(tools, "obsbot_preset_update");
+
+  const result = await tool.handler({ slot: 1 });
+
+  expect(result).toEqual({ ok: false, error: "slot 1 is empty; save first" });
+  expect(transport.sendVendor).not.toHaveBeenCalled();
+});
+
+test("obsbot_preset_update sends UPDATE with the live pose for an occupied slot then verifies", async () => {
+  const transport = makeFakeTransport();
+  transport.xuGetRaw = vi.fn(async (selector: number, _length: number) =>
+    selector === 12 ? Buffer.from("0100", "hex") : PRESET_ENTRY_1,
+  );
+  transport.xuRaw = vi.fn(async (_selector: number, _data: Buffer) => {});
+  // pan (prop 0) = 33 -> yaw 33; tilt (prop 1) = 5 -> pitch -5 (negated)
+  transport.camCtrlGet = vi.fn(async (p: number) =>
+    p === 0 ? { value: 33, flags: 2 } : { value: 5, flags: 2 },
+  );
+  const tools = createTools(makeFakeMgr(transport));
+  const tool = findTool(tools, "obsbot_preset_update");
+
+  const result = await tool.handler({ slot: 1 });
+
+  expect(transport.sendVendor).toHaveBeenCalledTimes(1);
+  const frame = transport.sendVendor.mock.calls[0][0] as Buffer;
+  expect(frame.subarray(10, 12).toString("hex")).toBe("043e"); // cmd 0x3e04 LE
+  expect(frame.readFloatLE(20)).toBeCloseTo(33); // pan slotted after idx(4) + pan f32
+  expect(frame.readFloatLE(24)).toBeCloseTo(-5); // pitch = -tilt
+  expect(result).toMatchObject({ ok: true });
+});
+
+// --- obsbot_preset_rename ---
+
+test("obsbot_preset_rename rejects an empty slot", async () => {
+  const transport = makeFakeTransport();
+  transport.xuGetRaw = vi.fn(async (selector: number, _length: number) =>
+    selector === 12 ? emptyPresetListBlock() : Buffer.from("02000000", "hex"),
+  );
+  const tools = createTools(makeFakeMgr(transport));
+  const tool = findTool(tools, "obsbot_preset_rename");
+
+  const result = await tool.handler({ slot: 1, name: "Foo" });
+
+  expect(result).toEqual({ ok: false, error: "slot 1 is empty; save first" });
+  expect(transport.sendVendor).not.toHaveBeenCalled();
+});
+
+test("obsbot_preset_rename sends SET_NAME with the (truncated) name then verifies the new name", async () => {
+  const transport = makeFakeTransport();
+  const longName = "x".repeat(50);
+  const truncated = longName.slice(0, 40);
+  let listCall = 0;
+  // Guard read: slot occupied under old name "Preset1". Verify read: same slot, now
+  // under the new (truncated) name — the fake must reflect the rename on the SECOND
+  // read only, to prove the tool actually re-reads rather than trusting its own input.
+  transport.xuGetRaw = vi.fn(async (selector: number, _length: number) => {
+    if (selector === 12) {
+      listCall++;
+      return Buffer.from("0100", "hex");
+    }
+    return listCall <= 1 ? PRESET_ENTRY_1 : makePresetEntryBuffer(0, truncated);
+  });
+  transport.xuRaw = vi.fn(async (_selector: number, _data: Buffer) => {});
+  const tools = createTools(makeFakeMgr(transport));
+  const tool = findTool(tools, "obsbot_preset_rename");
+
+  const result = await tool.handler({ slot: 1, name: longName });
+
+  expect(transport.sendVendor).toHaveBeenCalledTimes(1);
+  const frame = transport.sendVendor.mock.calls[0][0] as Buffer;
+  expect(frame.subarray(10, 12).toString("hex")).toBe("843a"); // cmd 0x3a84 LE
+  expect(frame.subarray(16, 20).toString("hex")).toBe("00000000"); // idx(slot 1) = 0
+  const sentName = frame.subarray(20, 20 + truncated.length).toString("ascii");
+  expect(sentName).toBe(truncated);
+  expect(sentName.length).toBe(40);
+  expect(result).toMatchObject({ ok: true });
+  const slot = (result as { slot: Record<string, unknown> }).slot;
+  expect(slot).toMatchObject({ slot: 1, occupied: true, name: truncated });
+});
+
+test("obsbot_preset_rename returns a structured failure when the device didn't apply the new name", async () => {
+  const transport = makeFakeTransport();
+  // List/entry reads never change -> stays "Preset1" on both the guard and verify read.
+  transport.xuGetRaw = vi.fn(async (selector: number, _length: number) =>
+    selector === 12 ? Buffer.from("0100", "hex") : PRESET_ENTRY_1,
+  );
+  transport.xuRaw = vi.fn(async (_selector: number, _data: Buffer) => {});
+  const tools = createTools(makeFakeMgr(transport));
+  const tool = findTool(tools, "obsbot_preset_rename");
+
+  const result = await tool.handler({ slot: 1, name: "NewName" });
+
+  expect(result).toEqual({
+    ok: false,
+    error: "verification failed",
+    expected: "NewName",
+    actual: "Preset1",
+  });
+});
+
+// --- obsbot_preset_delete ---
+
+test("obsbot_preset_delete rejects an already-empty slot", async () => {
+  const transport = makeFakeTransport();
+  transport.xuGetRaw = vi.fn(async (selector: number, _length: number) =>
+    selector === 12 ? emptyPresetListBlock() : Buffer.from("02000000", "hex"),
+  );
+  const tools = createTools(makeFakeMgr(transport));
+  const tool = findTool(tools, "obsbot_preset_delete");
+
+  const result = await tool.handler({ slot: 1 });
+
+  expect(result).toEqual({ ok: false, error: "slot 1 is already empty" });
+  expect(transport.sendVendor).not.toHaveBeenCalled();
+});
+
+test("obsbot_preset_delete sends the DELETE frame for an occupied slot then verifies it's empty", async () => {
+  // State-driven: occupied until the DELETE frame is sent, empty after - so the tool
+  // must actually re-read to observe the change.
+  const transport = statefulPresetTransport(Buffer.from("0100", "hex"), emptyPresetListBlock());
+  const tools = createTools(makeFakeMgr(transport));
+  const tool = findTool(tools, "obsbot_preset_delete");
+
+  const result = await tool.handler({ slot: 1 });
+
+  expect(transport.sendVendor).toHaveBeenCalledTimes(1);
+  const frame = transport.sendVendor.mock.calls[0][0] as Buffer;
+  expect(frame.subarray(10, 12).toString("hex")).toBe("8439"); // cmd 0x3984 LE
+  expect(result).toMatchObject({ ok: true, deleted: { name: "Preset1" } });
+});
+
+test("obsbot_preset_delete returns a structured failure if the slot is still occupied after delete", async () => {
+  const transport = makeFakeTransport();
+  // List/entry reads never change -> slot stays occupied on both reads.
+  transport.xuGetRaw = vi.fn(async (selector: number, _length: number) =>
+    selector === 12 ? Buffer.from("0100", "hex") : PRESET_ENTRY_1,
+  );
+  transport.xuRaw = vi.fn(async (_selector: number, _data: Buffer) => {});
+  const tools = createTools(makeFakeMgr(transport));
+  const tool = findTool(tools, "obsbot_preset_delete");
+
+  const result = await tool.handler({ slot: 1 });
+
+  expect(result).toEqual({ ok: false, error: "verification failed", expected: "empty", actual: "occupied" });
+});
+
+// --- I2: all six preset tools are gated (readiness-checked) like other gimbal tools ---
+
+const PRESET_TOOL_ARGS: Record<string, unknown> = {
+  obsbot_preset_list: {},
+  obsbot_preset_save: { slot: 1 },
+  obsbot_preset_recall: { slot: 1 },
+  obsbot_preset_update: { slot: 1 },
+  obsbot_preset_rename: { slot: 1, name: "Foo" },
+  obsbot_preset_delete: { slot: 1 },
+};
+
+for (const name of Object.keys(PRESET_TOOL_ARGS)) {
+  test(`I2: ${name} is gated — returns the readiness error and never touches the device when unreachable`, async () => {
+    const transport = makeFakeTransport();
+    transport.recvStatus = vi.fn(async () => {
+      throw new Error("KsProperty GET failed");
+    });
+    const tools = createTools(makeFakeMgr(transport));
+    const tool = findTool(tools, name);
+
+    const result = await tool.handler(PRESET_TOOL_ARGS[name]);
+
+    expect(result).toMatchObject({ ok: false, reason: "unreachable" });
+    expect(transport.xuGetRaw).not.toHaveBeenCalled();
+    expect(transport.sendVendor).not.toHaveBeenCalled();
+  });
+}
+
+// --- M1: a failure after the ADD/UPDATE write has already committed must say so ---
+
+test("M1: obsbot_preset_save reports a plain save failure when the ADD write itself throws (nothing committed)", async () => {
+  const transport = makeFakeTransport();
+  transport.xuGetRaw = vi.fn(async () => emptyPresetListBlock());
+  transport.sendVendor = vi.fn(async () => {
+    throw new Error("device NAK");
+  });
+  const tools = createTools(makeFakeMgr(transport));
+  const tool = findTool(tools, "obsbot_preset_save");
+
+  const result = await tool.handler({ slot: 1 });
+
+  expect(result).toMatchObject({ ok: false });
+  const error = (result as { error: string }).error;
+  // Nothing committed yet — must NOT claim the preset was saved.
+  expect(error).not.toMatch(/saved to slot/i);
+  expect(error).toMatch(/save failed/i);
+});
+
+// --- M2: catch blocks report a safe message even for a non-Error throw ---
+
+test("M2: obsbot_preset_list surfaces a readable error even when a non-Error is thrown", async () => {
+  const transport = makeFakeTransport();
+  transport.xuGetRaw = vi.fn(async () => {
+    throw "camera unplugged"; // eslint-disable-line no-throw-literal -- simulate a non-Error throw
+  });
+  const tools = createTools(makeFakeMgr(transport));
+  const tool = findTool(tools, "obsbot_preset_list");
+
+  const result = await tool.handler({});
+
+  expect(result).toMatchObject({ ok: false });
+  const error = (result as { error: string }).error;
+  expect(error).not.toBe("undefined");
+  expect(error).toContain("camera unplugged");
+});
+
+// --- Empty-state: a genuinely empty device returns an ALL-ZERO selector-12 block ---
+// Hardware-established 2026-07-19 under controlled conditions (OBSBOT Center closed so
+// nothing could re-assert presets, camera MEASURED awake before and at the moment of
+// failure, stable across repeated reads). Deleting the last preset yields a bit-for-bit
+// all-zero block, so "all-zero" is genuinely ambiguous between EMPTY and NOT-SERVING.
+//
+// The discriminator is the STATUS BLOCK on the same XU surface and handle: at the exact
+// instant selector 12 read zeros, the status block returned real non-zero data. A dead
+// link / stale handle would zero BOTH. Note UVC liveness is NOT valid corroboration —
+// obsbot_gimbal_position returns a correct pose even when presets aren't serving.
+//
+// Corroboration is deliberately TWO-part (non-zero AND awake): decodeStatus reports
+// awake for an ALL-ZERO block (awake === block[2] === 0), so "awake" alone would let a
+// dead link masquerade as an empty device — the exact false-EMPTY that gates the
+// irreversible create-once ADD.
+
+test("empty device: save can bootstrap the FIRST preset when all slots are empty", async () => {
+  // Regression for the dead-end: every preset tool routes through getPresetSlots, so
+  // an all-zero read blocked save too — leaving our toolset with no path OUT of a
+  // legitimate device state (fatal where OBSBOT Center doesn't exist to create one).
+  const transport = statefulPresetTransport(Buffer.alloc(60), Buffer.from("0100", "hex"));
+  transport.recvStatus = vi.fn(async () => HEALTHY_STATUS_AWAKE);
+  transport.camCtrlGet = vi.fn(async (p: number) =>
+    p === 0 ? { value: 21, flags: 2 } : { value: 0, flags: 2 },
+  );
+  const tools = createTools(makeFakeMgr(transport));
+  const tool = findTool(tools, "obsbot_preset_save");
+
+  const result = await tool.handler({ slot: 1 });
+
+  expect(result).toMatchObject({ ok: true });
+  expect(transport.sendVendor).toHaveBeenCalled();
+});
+
+test("all-zero selector 12 while the camera reports asleep is refused, not read as empty", async () => {
+  const transport = makeFakeTransport();
+  transport.xuGetRaw = vi.fn(async () => Buffer.alloc(60));
+  transport.recvStatus = vi.fn(async () => HEALTHY_STATUS_ASLEEP);
+  const tools = createTools(makeFakeMgr(transport));
+  const tool = findTool(tools, "obsbot_preset_list");
+
+  const result = await tool.handler({});
+
+  expect(result).toMatchObject({ ok: false });
+  expect(transport.xuRaw).not.toHaveBeenCalled();
+});
+
+test("delete of the LAST preset reports success once the device reads back empty", async () => {
+  // Observed on hardware: delete committed but reported {ok:false} because the
+  // post-write verify read hit the all-zero (now-empty) block and threw.
+  const transport = statefulPresetTransport(Buffer.from("0101", "hex"), Buffer.alloc(60), PRESET_ENTRY_2);
+  transport.recvStatus = vi.fn(async () => HEALTHY_STATUS_AWAKE);
+  const tools = createTools(makeFakeMgr(transport));
+  const tool = findTool(tools, "obsbot_preset_delete");
+
+  const result = await tool.handler({ slot: 2 });
+
+  expect(result).toMatchObject({ ok: true });
+});
+
+test("a write that commits but fails verification says so, instead of implying nothing happened", async () => {
+  const transport = makeFakeTransport();
+  let listCall = 0;
+  transport.xuGetRaw = vi.fn(async (selector: number) => {
+    if (selector === 12) {
+      if (++listCall === 1) return Buffer.from("0101", "hex");
+      throw new Error("camera unplugged");
+    }
+    return PRESET_ENTRY_2;
+  });
+  transport.recvStatus = vi.fn(async () => HEALTHY_STATUS_AWAKE);
+  const tools = createTools(makeFakeMgr(transport));
+  const tool = findTool(tools, "obsbot_preset_delete");
+
+  const result = await tool.handler({ slot: 2 });
+
+  expect(result).toMatchObject({ ok: false });
+  // The destructive write already landed — the caller must not read this as a no-op
+  // and retry blindly.
+  expect((result as { error: string }).error).toMatch(/verif/i);
+  expect((result as { error: string }).error).toMatch(/sent|committed|applied/i);
+});
+
+// --- Due diligence around destructive writes ---------------------------------
+// Risk order (user-stated): (1) never damage the camera, (2) never lose the
+// customer's data, (3) everything else — latency included — is negotiable below
+// those. Reads cannot do either kind of harm, so they are retried and
+// double-checked freely; writes are NEVER retried.
+//
+// Only ONE wrong read destroys data: believing a slot is EMPTY when it is
+// occupied, which fires a create-once ADD at a customer's preset (the firmware's
+// behaviour there is undecoded — it may overwrite). The reverse error is benign:
+// a slot wrongly believed occupied makes delete a no-op and update fail. So the
+// EMPTY verdict — and only the EMPTY verdict — is confirmed by a second read.
+
+// Retry timings are injected so the suite never actually sleeps.
+const FAST_READ = { attempts: 3, backoffMs: [1, 1, 1] };
+
+test("an EMPTY verdict is confirmed by a second read before it is trusted", async () => {
+  const transport = makeFakeTransport();
+  let listReads = 0;
+  transport.xuGetRaw = vi.fn(async (selector: number) => {
+    if (selector === 12) listReads++;
+    return Buffer.alloc(60);
+  });
+  const tools = createTools(makeFakeMgr(transport), undefined, false, FAST_READ);
+  const tool = findTool(tools, "obsbot_preset_list");
+
+  const result = await tool.handler({});
+
+  expect(result).toMatchObject({ ok: true });
+  expect(listReads).toBe(2); // the verdict that can destroy data is never single-sampled
+});
+
+test("an unstable EMPTY (second read disagrees) never authorizes a create-once write", async () => {
+  const transport = makeFakeTransport();
+  let listReads = 0;
+  transport.xuGetRaw = vi.fn(async (selector: number) => {
+    if (selector === 12) {
+      // reads alternate empty / occupied — a device caught mid-transition
+      return ++listReads % 2 === 1 ? Buffer.alloc(60) : Buffer.from("0100", "hex");
+    }
+    return PRESET_ENTRY_1;
+  });
+  transport.camCtrlGet = vi.fn(async () => ({ value: 0, flags: 2 }));
+  const tools = createTools(makeFakeMgr(transport), undefined, false, FAST_READ);
+  const tool = findTool(tools, "obsbot_preset_save");
+
+  const result = await tool.handler({ slot: 1 });
+
+  expect(result).toMatchObject({ ok: false });
+  // The whole point: an unconfirmed EMPTY must not become an ADD.
+  expect(transport.sendVendor).not.toHaveBeenCalled();
+});
+
+test("delete hands back the preset it destroyed, so it can be restored", async () => {
+  const transport = makeFakeTransport();
+  let listCall = 0;
+  transport.xuGetRaw = vi.fn(async (selector: number) => {
+    if (selector === 12) return ++listCall === 1 ? Buffer.from("0101", "hex") : Buffer.alloc(60);
+    return PRESET_ENTRY_2; // slot 2, "Preset2", pan 21.2 tilt 0.7
+  });
+  const tools = createTools(makeFakeMgr(transport), undefined, false, FAST_READ);
+  const tool = findTool(tools, "obsbot_preset_delete");
+
+  const result = await tool.handler({ slot: 2 });
+
+  expect(result).toMatchObject({
+    ok: true,
+    deleted: { name: "Preset2", pose: { pan: 21.2, tilt: 0.7, roll: 0, zoom: 1 } },
+  });
+});
+
+test("update hands back the pose it overwrote, so it can be restored", async () => {
+  const transport = makeFakeTransport();
+  transport.xuGetRaw = vi.fn(async (selector: number) =>
+    selector === 12 ? Buffer.from("0101", "hex") : PRESET_ENTRY_2,
+  );
+  transport.camCtrlGet = vi.fn(async (p: number) =>
+    p === 0 ? { value: 40, flags: 2 } : { value: -14, flags: 2 },
+  );
+  const tools = createTools(makeFakeMgr(transport), undefined, false, FAST_READ);
+  const tool = findTool(tools, "obsbot_preset_update");
+
+  const result = await tool.handler({ slot: 2 });
+
+  expect(result).toMatchObject({
+    ok: true,
+    previous: { pan: 21.2, tilt: 0.7, roll: 0, zoom: 1 },
+  });
+});
+
+test("a transient read failure is retried rather than surfaced to the caller", async () => {
+  const transport = makeFakeTransport();
+  let listCall = 0;
+  let entryCall = 0;
+  const entries = [PRESET_ENTRY_1, PRESET_ENTRY_2, PRESET_ENTRY_3];
+  transport.xuGetRaw = vi.fn(async (selector: number) => {
+    if (selector === 12) {
+      // first attempt lands mid-transition (all zeros, no corroboration), then recovers
+      if (++listCall === 1) return Buffer.alloc(60);
+      return PRESET_LIST_BLOCK;
+    }
+    return entries[entryCall++ % entries.length];
+  });
+  transport.recvStatus = vi.fn(async () => Buffer.alloc(60)); // uncorroborated => not "empty"
+  const tools = createTools(makeFakeMgr(transport), undefined, false, FAST_READ);
+  const tool = findTool(tools, "obsbot_preset_list");
+
+  const result = await tool.handler({});
+
+  expect(result).toMatchObject({ ok: true });
+  expect(listCall).toBeGreaterThan(1); // it really did re-read
+});
+
+test("retries are bounded — a persistently bad read fails loudly instead of spinning", async () => {
+  const transport = makeFakeTransport();
+  let listReads = 0;
+  transport.xuGetRaw = vi.fn(async (selector: number) => {
+    if (selector === 12) listReads++;
+    return Buffer.alloc(60);
+  });
+  transport.recvStatus = vi.fn(async () => Buffer.alloc(60)); // dead link: both zeroed
+  const tools = createTools(makeFakeMgr(transport), undefined, false, FAST_READ);
+  const tool = findTool(tools, "obsbot_preset_list");
+
+  const result = await tool.handler({});
+
+  expect(result).toMatchObject({ ok: false });
+  expect(listReads).toBe(3); // exactly `attempts`, no runaway
+  expect(transport.xuRaw).not.toHaveBeenCalled();
+});
+
+// --- snapshot resolution -----------------------------------------------------
+// `resolution` replaces the old `maxDim` and defaults to 640, not 1024. Snapshots
+// are base64'd into a tool response an LLM then reads, so the default is chosen to
+// keep token cost low; a caller that needs detail asks for it explicitly.
+test("obsbot_capture_snapshot defaults to 640 and forwards it as maxDim", async () => {
+  const transport = makeFakeTransport();
+  const tools = createTools(makeFakeMgr(transport));
+  await tools.find((t) => t.name === "obsbot_capture_snapshot")!.handler({});
+  expect(transport.snapshot).toHaveBeenCalledWith(
+    expect.objectContaining({ maxDim: 640 }),
+  );
+});
+
+test("obsbot_capture_snapshot honours an explicit resolution", async () => {
+  const transport = makeFakeTransport();
+  const tools = createTools(makeFakeMgr(transport));
+  await tools.find((t) => t.name === "obsbot_capture_snapshot")!.handler({ resolution: 1920 });
+  expect(transport.snapshot).toHaveBeenCalledWith(
+    expect.objectContaining({ maxDim: 1920 }),
+  );
+});
+
+// --- obsbot_gimbal_move_speed: units and bounds ---
+//
+// Alone among the gimbal tools this one passed yaw/pitch straight through to
+// the firmware: no clamp, and a description that said "speed" without ever
+// saying speed in WHAT. Callers had to reverse-engineer the unit.
+//
+// Measured on hardware 2026-07-21 by timing moves against the live position
+// readback: 10/1000ms -> 10 deg, 20/700ms -> 14 deg, 60/500ms -> 29 deg,
+// 120/300ms -> 35 deg, 170/300ms -> 49 deg. The value is degrees per second,
+// linear across the whole usable band.
+//
+// Above that the firmware does not saturate -- it silently IGNORES the
+// command: 180, 200 and 300 each produced EXACTLY 0 degrees of motion while
+// still returning ok:true. An unclamped caller therefore gets a successful
+// result and a camera that never moved, which is the worst of both worlds.
+test("obsbot_gimbal_move_speed clamps to the hardware-verified degrees/second band", async () => {
+  const transport = makeFakeTransport();
+  const tools = createToolsAsIfNotLinux(makeFakeMgr(transport));
+  const tool = findTool(tools, "obsbot_gimbal_move_speed");
+
+  await tool.handler({ yaw: 999, pitch: -999, roll: 0, autoStopMs: 0 });
+
+  expect(transport.gimbalSpeed).toHaveBeenCalledTimes(1);
+  const [yaw, pitch] = transport.gimbalSpeed.mock.calls[0]!;
+  expect(yaw).toBe(150);
+  expect(pitch).toBe(-150);
+});
+
+test("obsbot_gimbal_move_speed reports the clamped speed it actually used", async () => {
+  const transport = makeFakeTransport();
+  const tools = createToolsAsIfNotLinux(makeFakeMgr(transport));
+  const tool = findTool(tools, "obsbot_gimbal_move_speed");
+
+  const result = (await tool.handler({ yaw: 999, pitch: 0, roll: 0, autoStopMs: 0 })) as {
+    yaw: number;
+  };
+  expect(result.yaw).toBe(150);
+});
+
+test("obsbot_gimbal_move_speed documents its unit as degrees per second", async () => {
+  const tool = findTool(createToolsAsIfNotLinux(makeFakeMgr()), "obsbot_gimbal_move_speed");
+  expect(tool.description).toMatch(/degrees per second|deg\/s/i);
+});
+
+test("obsbot_gimbal_move_speed leaves in-range speeds untouched", async () => {
+  const transport = makeFakeTransport();
+  const tools = createToolsAsIfNotLinux(makeFakeMgr(transport));
+  const tool = findTool(tools, "obsbot_gimbal_move_speed");
+
+  await tool.handler({ yaw: 30, pitch: -20, roll: 0, autoStopMs: 0 });
+  const [yaw, pitch] = transport.gimbalSpeed.mock.calls[0]!;
+  expect(yaw).toBe(30);
+  expect(pitch).toBe(-20);
+});
+
+// --- Tool descriptions are the model's only documentation ---
+//
+// These are read at the call site by the caller choosing arguments, so a
+// description that is wrong or silent about a hazard costs a failed call or an
+// unexpected physical movement. Each assertion below corresponds to something
+// found on hardware 2026-07-21 that the description did not convey.
+const describedBy = (name: string): string =>
+  findTool(createTools(makeFakeMgr(), undefined, true), name).description;
+
+test("obsbot_image_adjust warns that gain/backlight-compensation are unimplemented here", () => {
+  // Both report GET_LEN 0 on the Tiny 2 and now hard-error, but the enum still
+  // offers them, so a caller reading the old text would keep trying.
+  const d = describedBy("obsbot_image_adjust");
+  expect(d).toMatch(/gain/);
+  expect(d).toMatch(/not (implemented|supported)|unsupported/i);
+});
+
+test("obsbot_capture_record describes its default path without Windows separators", () => {
+  const d = describedBy("obsbot_capture_record");
+  expect(d).not.toMatch(/Videos\\/);       // "Videos\\OBSBOT" is wrong off Windows
+  expect(d).toMatch(/Videos\/OBSBOT/);
+});
+
+test("obsbot_status documents faceAe, which it actually returns", () => {
+  expect(describedBy("obsbot_status")).toMatch(/faceAe/);
+});
+
+test("obsbot_gimbal_recenter states its target pose and that it returns before arriving", () => {
+  const d = describedBy("obsbot_gimbal_recenter");
+  expect(d).toMatch(/0\s*°?\s*\/\s*0|yaw 0|0,\s*0/i);
+  expect(d).toMatch(/still be moving|before .* (arriv|complet)|asynchronous/i);
+});
+
+test("obsbot_sleep warns that it stows the gimbal", () => {
+  // Measured: sleep drives pitch to ~84° (camera face-down), wake returns to 0.
+  // That is a large physical movement a caller should not discover by surprise.
+  const d = describedBy("obsbot_sleep");
+  expect(d).toMatch(/stow|84|physically|points? down/i);
+});
+
+test("obsbot_wake warns that it un-stows the gimbal", () => {
+  expect(describedBy("obsbot_wake")).toMatch(/stow|level|physically|moves/i);
+});
+
+test("obsbot_image_exposure_manual documents the raw field it returns", () => {
+  expect(describedBy("obsbot_image_exposure_manual")).toMatch(/`?raw`?/);
+});
+
+// --- obsbot_aim_at_pixel ---
+//
+// The tool takes NO optics parameters: it reads the FOV mode from the status
+// block instead. An earlier design took `fov` from the caller, which would have
+// made a wrong value a silent 36% aiming error (wide vs narrow).
+//
+// Everything it cannot verify is a refusal, never a silent miss.
+
+// Status block variants. HEALTHY_STATUS_AWAKE already reads wide (block[0x11]=0)
+// with no zoom (block[0x04]=0), so it serves as the happy path unmodified.
+const statusFov = (fovByte: number, zoomByte = 0): Buffer => {
+  const b = Buffer.from(HEALTHY_STATUS_AWAKE);
+  b[0x11] = fovByte;
+  b[0x04] = zoomByte;
+  return b;
+};
+// AI mode tuple lives at block[0x18] / block[0x1c]; the awake fixture decodes to
+// no-tracking. Setting m=2 moves it off no-tracking (see AI_MODE_TABLE).
+const statusTracking = (): Buffer => {
+  const b = Buffer.from(HEALTHY_STATUS_AWAKE);
+  b[0x18] = 2;
+  b[0x1c] = 0;
+  return b;
+};
+
+const HD_FRAME = { frameWidth: 1280, frameHeight: 720 };
+
+test("aiming at the center pixel leaves the pose unchanged", async () => {
+  const transport = makeFakeTransport();
+  const tool = findTool(createTools(makeFakeMgr(transport)), "obsbot_aim_at_pixel");
+  const r = (await tool.handler({ x: 640, y: 360, ...HD_FRAME })) as {
+    ok: boolean; target: { yaw: number; pitch: number }; clamped: boolean; fovMode: string;
+  };
+  expect(r.ok).toBe(true);
+  expect(r.target.yaw).toBeCloseTo(0, 6);
+  expect(r.target.pitch).toBeCloseTo(0, 6);
+  expect(r.clamped).toBe(false);
+  expect(r.fovMode).toBe("wide");
+  expect(transport.gimbalSet).toHaveBeenCalled();
+});
+
+// --- OBSBOT_LIVE_POSE release gate (readSteadyPose) ---
+//
+// The pose feeding aimAtPixel becomes a composed ABSOLUTE target, so reading it
+// mid-slew aims short by the travel remaining. That can only happen where the
+// read is live: macOS always, Linux only on a kernel carrying the uvcvideo
+// AUTO_UPDATE fixup or the volatile patch. Neither is upstream, so settling is
+// gated off and stock behaviour is byte-for-byte unchanged.
+
+test("gate off: the pose is read once per axis, no settling poll", async () => {
+  const prev = process.env.OBSBOT_LIVE_POSE;
+  delete process.env.OBSBOT_LIVE_POSE;
+  try {
+    const transport = makeFakeTransport();
+    // A pose that is still travelling: every read returns something different.
+    let n = 0;
+    transport.camCtrlGet = vi.fn(async (_p: number) => ({ value: n++ * 10, flags: 2 }));
+    const tool = findTool(createTools(makeFakeMgr(transport)), "obsbot_aim_at_pixel");
+    const r = (await tool.handler({ x: 640, y: 360, ...HD_FRAME })) as { ok: boolean };
+    expect(r.ok).toBe(true);
+    // Exactly two reads (pan, tilt). Settling would have taken at least four.
+    expect(transport.camCtrlGet).toHaveBeenCalledTimes(2);
+  } finally {
+    if (prev === undefined) delete process.env.OBSBOT_LIVE_POSE;
+    else process.env.OBSBOT_LIVE_POSE = prev;
+  }
+});
+
+test("gate on: a moving gimbal is polled until the pose stops changing", async () => {
+  const prev = process.env.OBSBOT_LIVE_POSE;
+  process.env.OBSBOT_LIVE_POSE = "1";
+  try {
+    const transport = makeFakeTransport();
+    // Pan slews 0 -> 30 -> 60 -> 90 and then holds; tilt sits at 0 throughout.
+    // Reads arrive in (pan, tilt) pairs, so drive the ramp off the pan reads.
+    const panSeq = [0, 30, 60, 90, 90, 90, 90, 90];
+    let panIdx = 0;
+    transport.camCtrlGet = vi.fn(async (p: number) => {
+      if (p !== CAMERA_CONTROL_PAN) return { value: 0, flags: 2 };
+      return { value: panSeq[Math.min(panIdx++, panSeq.length - 1)], flags: 2 };
+    });
+    const tool = findTool(createTools(makeFakeMgr(transport)), "obsbot_aim_at_pixel");
+    const r = (await tool.handler({ x: 640, y: 360, ...HD_FRAME })) as {
+      ok: boolean; target: { yaw: number };
+    };
+    expect(r.ok).toBe(true);
+    // It kept polling past the ramp rather than composing against 0 or 30.
+    expect(panIdx).toBeGreaterThan(3);
+    // Centre pixel = no offset, so the target is whatever settled pose it read.
+    expect(r.target.yaw).toBeCloseTo(90, 6);
+  } finally {
+    if (prev === undefined) delete process.env.OBSBOT_LIVE_POSE;
+    else process.env.OBSBOT_LIVE_POSE = prev;
+  }
+});
+
+test("gate on: a gimbal holding position settles despite 1-degree dither", async () => {
+  const prev = process.env.OBSBOT_LIVE_POSE;
+  process.env.OBSBOT_LIVE_POSE = "1";
+  try {
+    const transport = makeFakeTransport();
+    // Measured on hardware 2026-08-21: a stationary gimbal reports one 3600
+    // arc-second step of jitter. A zero-tolerance band would never settle.
+    const dither = [40, 40, 41, 40, 41, 40, 40];
+    let i = 0;
+    transport.camCtrlGet = vi.fn(async (p: number) => {
+      if (p !== CAMERA_CONTROL_TILT) return { value: 0, flags: 2 };
+      return { value: dither[Math.min(i++, dither.length - 1)], flags: 2 };
+    });
+    const tool = findTool(createTools(makeFakeMgr(transport)), "obsbot_aim_at_pixel");
+    const r = (await tool.handler({ x: 640, y: 360, ...HD_FRAME })) as { ok: boolean };
+    expect(r.ok).toBe(true);
+    // Settled on the first comparison rather than polling to the deadline.
+    expect(transport.camCtrlGet).toHaveBeenCalledTimes(4);
+  } finally {
+    if (prev === undefined) delete process.env.OBSBOT_LIVE_POSE;
+    else process.env.OBSBOT_LIVE_POSE = prev;
+  }
+});
+
+test("an off-center pixel commands the offset the geometry module computes", async () => {
+  const transport = makeFakeTransport();
+  const tool = findTool(createTools(makeFakeMgr(transport)), "obsbot_aim_at_pixel");
+  // x=960 is u=0.5 on a 1280-wide frame; on wide (67deg) that is -18.31deg.
+  const r = (await tool.handler({ x: 960, y: 360, ...HD_FRAME })) as {
+    ok: boolean; target: { yaw: number }; offset: { dYaw: number };
+  };
+  expect(r.ok).toBe(true);
+  expect(r.offset.dYaw).toBeCloseTo(-18.3116, 2);
+  expect(r.target.yaw).toBeCloseTo(-18.3116, 2);
+});
+
+test("the FOV mode is READ, not assumed — narrow gives a different angle than wide", async () => {
+  const transport = makeFakeTransport();
+  transport.recvStatus = vi.fn(async () => statusFov(2)); // narrow
+  const tool = findTool(createTools(makeFakeMgr(transport)), "obsbot_aim_at_pixel");
+  const r = (await tool.handler({ x: 960, y: 360, ...HD_FRAME })) as {
+    ok: boolean; offset: { dYaw: number }; fovMode: string;
+  };
+  expect(r.ok).toBe(true);
+  expect(r.fovMode).toBe("narrow");
+  // narrow is 48.46deg, so u=0.5 gives -12.68deg, NOT wide's -18.31deg. This is
+  // the whole point of reading fovMode instead of assuming it.
+  expect(r.offset.dYaw).toBeCloseTo(-12.6805, 2);
+  expect(r.offset.dYaw).not.toBeCloseTo(-18.3116, 1);
+});
+
+test("active AI tracking is refused, naming the mode", async () => {
+  const transport = makeFakeTransport();
+  transport.recvStatus = vi.fn(async () => statusTracking());
+  const tool = findTool(createTools(makeFakeMgr(transport)), "obsbot_aim_at_pixel");
+  const r = (await tool.handler({ x: 640, y: 360, ...HD_FRAME })) as { ok: boolean; error: string };
+  expect(r.ok).toBe(false);
+  expect(r.error).toMatch(/track/i);
+  expect(r.error).toMatch(/obsbot_ai_track/);
+  expect(transport.gimbalSet).not.toHaveBeenCalled();
+});
+
+test("aiming works at a custom zoom, using the measured magnification", async () => {
+  // zoomPercent 50 is ratio 1.5, so m = 2.5. At u = 0.5 on a 1280-wide frame the
+  // offset is -atan(0.5 * tan(33.5)/2.5) = -7.5408 deg, against -18.3116 at
+  // wide. Aiming at wide's angle from a 2.5x zoom would overshoot by 10.8 deg.
+  //
+  // NOTE: the task brief's worked example for this test gave -7.5344, which
+  // does not reproduce from tan(33.5deg): computing -atan(0.5*tan(33.5deg)/2.5)
+  // directly gives -7.5408 (verified in node and matching this suite's other
+  // hand-worked angles, e.g. the -18.3116 wide figure above, which does
+  // reproduce exactly). Using the mathematically correct value here.
+  const transport = makeFakeTransport();
+  transport.recvStatus = vi.fn(async () => statusFov(3, 50));
+  const tool = findTool(createTools(makeFakeMgr(transport)), "obsbot_aim_at_pixel");
+  const r = (await tool.handler({ x: 960, y: 360, ...HD_FRAME })) as {
+    ok: boolean; offset: { dYaw: number };
+  };
+  expect(r.ok).toBe(true);
+  expect(r.offset.dYaw).toBeCloseTo(-7.5408, 3);
+  expect(transport.gimbalSet).toHaveBeenCalled();
+});
+
+test("a corrupt zoom reading that resolves outside the known magnification range is refused", async () => {
+  // zoomByte 200 -> zoomPercent 200 -> ratio 3.0 -> magnification 3*3-2 = 7,
+  // well outside [MIN_MAGNIFICATION, MAX_MAGNIFICATION] = [1, 4]. zoomPercent is
+  // read straight off a raw status byte (0-255), so a garbled read can produce
+  // exactly this: a "custom" mode with an implausible zoom behind it. This must
+  // refuse rather than aim from the bad number.
+  const transport = makeFakeTransport();
+  transport.recvStatus = vi.fn(async () => statusFov(3, 200));
+  const tool = findTool(createTools(makeFakeMgr(transport)), "obsbot_aim_at_pixel");
+  const r = (await tool.handler({ x: 640, y: 360, ...HD_FRAME })) as { ok: boolean; error: string };
+  expect(r.ok).toBe(false);
+  expect(r.error).toMatch(/magnification/i);
+  expect(transport.gimbalSet).not.toHaveBeenCalled();
+});
+
+test("an unrecognised FOV mode is refused rather than guessed", async () => {
+  const transport = makeFakeTransport();
+  transport.recvStatus = vi.fn(async () => statusFov(9));
+  const tool = findTool(createTools(makeFakeMgr(transport)), "obsbot_aim_at_pixel");
+  const r = (await tool.handler({ x: 640, y: 360, ...HD_FRAME })) as { ok: boolean; error: string };
+  expect(r.ok).toBe(false);
+  expect(transport.gimbalSet).not.toHaveBeenCalled();
+});
+
+test("a non-16:9 frame is refused as a transposition or typo", async () => {
+  const transport = makeFakeTransport();
+  const tool = findTool(createTools(makeFakeMgr(transport)), "obsbot_aim_at_pixel");
+  const r = (await tool.handler({ x: 100, y: 100, frameWidth: 720, frameHeight: 1280 })) as {
+    ok: boolean; error: string;
+  };
+  expect(r.ok).toBe(false);
+  expect(r.error).toMatch(/16:9|aspect/i);
+  expect(transport.gimbalSet).not.toHaveBeenCalled();
+});
+
+test("a pixel outside the frame is refused", async () => {
+  const transport = makeFakeTransport();
+  const tool = findTool(createTools(makeFakeMgr(transport)), "obsbot_aim_at_pixel");
+  const r = (await tool.handler({ x: 5000, y: 360, ...HD_FRAME })) as { ok: boolean; error: string };
+  expect(r.ok).toBe(false);
+  expect(transport.gimbalSet).not.toHaveBeenCalled();
+});
+
+test("saturation is reported and never commands an out-of-range pose", async () => {
+  const transport = makeFakeTransport();
+  // Current yaw 149; the left frame edge adds +34deg, which would be 183.
+  transport.camCtrlGet = vi.fn(async (p: number) => ({ value: p === 0 ? 149 : 0, flags: 0 }));
+  const tool = findTool(createTools(makeFakeMgr(transport)), "obsbot_aim_at_pixel");
+  const r = (await tool.handler({ x: 0, y: 360, ...HD_FRAME })) as {
+    ok: boolean; target: { yaw: number }; clamped: boolean;
+  };
+  expect(r.ok).toBe(true);
+  expect(r.clamped).toBe(true);
+  expect(r.target.yaw).toBe(GIMBAL_YAW_LIMIT_DEG);
+  expect(transport.gimbalSet).toHaveBeenCalledWith(GIMBAL_YAW_LIMIT_DEG, expect.any(Number), expect.any(Number));
+});
+
+test("an over-the-top target is refused without moving the gimbal, even though it would clamp", async () => {
+  // Current pose yaw 0 / pitch 85 (tilt.value = -85 since pitch = -tilt).
+  // Aiming at the bottom-centre pixel resolves to yaw -180 / pitch 75.4, which
+  // clamps to yaw -150 — a legitimate-looking clamp that actually points 150
+  // degrees away from the target. This must refuse, not move-and-report-clamped.
+  const transport = makeFakeTransport();
+  transport.camCtrlGet = vi.fn(async (p: number) => ({ value: p === 0 ? 0 : -85, flags: 0 }));
+  const tool = findTool(createTools(makeFakeMgr(transport)), "obsbot_aim_at_pixel");
+  const r = (await tool.handler({ x: 640, y: 720, ...HD_FRAME })) as { ok: boolean; error: string };
+  expect(r.ok).toBe(false);
+  expect(r.error).toMatch(/vertical/i);
+  expect(r.error).toMatch(/tilt/i);
+  expect(transport.gimbalSet).not.toHaveBeenCalled();
+});
+
+test("an ordinary out-of-range clamp (not over the top) still moves and reports clamped: true", async () => {
+  // Current yaw 149, pitch 0. The left frame edge adds ~+34deg, past the yaw
+  // limit — an ordinary clamp toward the target's own side, not an
+  // over-the-top reversal, so the camera should still move.
+  const transport = makeFakeTransport();
+  transport.camCtrlGet = vi.fn(async (p: number) => ({ value: p === 0 ? 149 : 0, flags: 0 }));
+  const tool = findTool(createTools(makeFakeMgr(transport)), "obsbot_aim_at_pixel");
+  const r = (await tool.handler({ x: 0, y: 360, ...HD_FRAME })) as {
+    ok: boolean; clamped: boolean; target: { yaw: number };
+  };
+  expect(r.ok).toBe(true);
+  expect(r.clamped).toBe(true);
+  expect(r.target.yaw).toBe(GIMBAL_YAW_LIMIT_DEG);
+  expect(transport.gimbalSet).toHaveBeenCalled();
+});
+
+test("a sleeping camera is woken, then refused — the wake invalidated the caller's frame", async () => {
+  const transport = makeFakeTransport();
+  let first = true;
+  transport.recvStatus = vi.fn(async () => {
+    if (first) { first = false; return HEALTHY_STATUS_ASLEEP; }
+    return HEALTHY_STATUS_AWAKE;
+  });
+  const tool = findTool(createTools(makeFakeMgr(transport)), "obsbot_aim_at_pixel");
+  const r = (await tool.handler({ x: 640, y: 360, ...HD_FRAME })) as { ok: boolean; error: string };
+  expect(r.ok).toBe(false);
+  expect(r.error).toMatch(/fresh snapshot/i);
+  expect(transport.gimbalSet).not.toHaveBeenCalled();
+});
+
+test("the tool description warns that the frame size must match the pixel's frame", () => {
+  const tool = findTool(createTools(makeFakeMgr()), "obsbot_aim_at_pixel");
+  expect(tool.description).toMatch(/same/i);
+  expect(tool.description).toMatch(/obsbot_capture_snapshot/);
+});
+
+// z.coerce.number() silently turns null/true/[]/"" into 0, which would let
+// {x: null, y: null, ...} through as a (wrong) aim at the frame's top-left corner
+// and command a real gimbal move. num() (the schema's usual numeric coercion,
+// used everywhere else in this file) accepts numeric strings but rejects those.
+test("non-numeric x/y (null) are rejected, not coerced to 0, and never move the gimbal", async () => {
+  const transport = makeFakeTransport();
+  const tool = findTool(createTools(makeFakeMgr(transport)), "obsbot_aim_at_pixel");
+  await expect(
+    tool.handler({ x: null, y: null, frameWidth: 1280, frameHeight: 720 }),
+  ).rejects.toThrow();
+  expect(transport.gimbalSet).not.toHaveBeenCalled();
+});
+
+test("string-encoded numeric x/y still work", async () => {
+  const transport = makeFakeTransport();
+  const tool = findTool(createTools(makeFakeMgr(transport)), "obsbot_aim_at_pixel");
+  const r = (await tool.handler({ x: "960", y: "360", ...HD_FRAME })) as { ok: boolean };
+  expect(r.ok).toBe(true);
+  expect(transport.gimbalSet).toHaveBeenCalled();
+});
+
+// --- obsbot_zoom_to_fit ---
+//
+// Frames a region: centre the gimbal on it, zoom so it fills the frame. Shares
+// obsbot_aim_at_pixel's refusal conditions and its schema style (num().pipe(finite))
+// — see that tool's test block above for the checks this one reuses rather than
+// re-testing independently.
+//
+// HEALTHY_STATUS_AWAKE (top of file) is unmodified wide/m=1/zoomPercent=0, so
+// every test below that doesn't override recvStatus starts from magnification 1.
+
+const FULL_FRAME = { frameWidth: 1920, frameHeight: 1080 };
+// Timings injected so the "never settles" test doesn't actually wait 3s.
+const FAST_ZOOM_SETTLE = { pollMs: 1, timeoutMs: 5 };
+
+test("fitting a region computes the magnification that makes it fill the frame", async () => {
+  // A 480x270 region in a 1920x1080 frame is a quarter of each axis, so it needs
+  // 4x more magnification; the default 10% margin backs that off to 3.6364,
+  // which is ratio 1.8788. Region is centred, so the aim itself is a no-op —
+  // this test is about the magnification arithmetic, not the aim.
+  const transport = makeFakeTransport();
+  const tool = findTool(createTools(makeFakeMgr(transport)), "obsbot_zoom_to_fit");
+  const r = (await tool.handler({ x: 720, y: 405, width: 480, height: 270, ...FULL_FRAME })) as {
+    ok: boolean; magnification: number; ratio: number; clamped: boolean;
+  };
+  expect(r.ok).toBe(true);
+  expect(r.magnification).toBeCloseTo(3.6364, 4);
+  expect(r.ratio).toBeCloseTo(1.8788, 4);
+  expect(r.clamped).toBe(false);
+});
+
+test("the tighter axis wins, so the whole region fits", async () => {
+  // 960x270 needs 2x horizontally and 4x vertically. Taking the MAX would crop
+  // the region's sides; min() fits all of it. -> m' = 2/1.1 = 1.8182
+  const transport = makeFakeTransport();
+  const tool = findTool(createTools(makeFakeMgr(transport)), "obsbot_zoom_to_fit");
+  const r = (await tool.handler({ x: 480, y: 405, width: 960, height: 270, ...FULL_FRAME })) as {
+    ok: boolean; magnification: number; clamped: boolean;
+  };
+  expect(r.ok).toBe(true);
+  expect(r.magnification).toBeCloseTo(1.8182, 4);
+  expect(r.clamped).toBe(false);
+});
+
+test("a fit demanding more than 4x is clamped and reported", async () => {
+  // 192x108 wants 10x. The scale stops at 4. clamped:true, ratio 2.0, and the
+  // camera still moves and still zooms to the limit — a partial fit beats none.
+  const transport = makeFakeTransport();
+  const tool = findTool(createTools(makeFakeMgr(transport)), "obsbot_zoom_to_fit");
+  const r = (await tool.handler({ x: 864, y: 486, width: 192, height: 108, ...FULL_FRAME })) as {
+    ok: boolean; magnification: number; ratio: number; clamped: boolean;
+  };
+  expect(r.ok).toBe(true);
+  expect(r.clamped).toBe(true);
+  expect(r.magnification).toBeCloseTo(4, 4);
+  expect(r.ratio).toBeCloseTo(2.0, 4);
+  expect(transport.gimbalSet).toHaveBeenCalled();
+  expect(transport.zoomSet).toHaveBeenCalled();
+});
+
+test("a region already filling the frame clamps at the wide end", async () => {
+  // From m=1 a full-frame region wants 1/1.1 = 0.909, below the 1.0 floor.
+  // clamped:true, ratio:1.0.
+  const transport = makeFakeTransport();
+  const tool = findTool(createTools(makeFakeMgr(transport)), "obsbot_zoom_to_fit");
+  const r = (await tool.handler({ x: 0, y: 0, width: 1920, height: 1080, ...FULL_FRAME })) as {
+    ok: boolean; magnification: number; ratio: number; clamped: boolean;
+  };
+  expect(r.ok).toBe(true);
+  expect(r.clamped).toBe(true);
+  expect(r.magnification).toBeCloseTo(1, 4);
+  expect(r.ratio).toBeCloseTo(1.0, 4);
+});
+
+test("the region's centre is what gets aimed at", async () => {
+  // Region (100,100,200,200) centres on (200,200), so the aim must match
+  // aimAtPixel(200, 200, ...) for the same optics and pose (current pose is
+  // yaw 0 / pitch 0, magnification 1 — the fake transport's defaults).
+  const transport = makeFakeTransport();
+  const tool = findTool(createTools(makeFakeMgr(transport)), "obsbot_zoom_to_fit");
+  const r = (await tool.handler({ x: 100, y: 100, width: 200, height: 200, ...FULL_FRAME })) as {
+    ok: boolean; target: { yaw: number; pitch: number };
+  };
+  const expected = aimAtPixel(
+    200, 200,
+    { width: FULL_FRAME.frameWidth, height: FULL_FRAME.frameHeight },
+    { magnification: 1 },
+    { yaw: 0, pitch: 0 },
+  );
+  expect(r.ok).toBe(true);
+  expect(r.target.yaw).toBeCloseTo(expected.target.yaw, 6);
+  expect(r.target.pitch).toBeCloseTo(expected.target.pitch, 6);
+});
+
+test.each([
+  ["negative width", { x: 0, y: 0, width: -10, height: 100 }],
+  ["zero height", { x: 0, y: 0, width: 100, height: 0 }],
+  ["off the right edge", { x: 1900, y: 0, width: 100, height: 100 }],
+  ["off the bottom", { x: 0, y: 1000, width: 100, height: 200 }],
+])("rejects a region that is not inside the frame: %s", async (_label, region) => {
+  const transport = makeFakeTransport();
+  const tool = findTool(createTools(makeFakeMgr(transport)), "obsbot_zoom_to_fit");
+  const r = (await tool.handler({ ...region, ...FULL_FRAME })) as { ok: boolean; error: string };
+  expect(r.ok).toBe(false);
+  expect(transport.gimbalSet).not.toHaveBeenCalled();
+  expect(transport.zoomSet).not.toHaveBeenCalled();
+});
+
+test("move happens before zoom — zoom is centre-preserving but not target-preserving", async () => {
+  const transport = makeFakeTransport();
+  const order: string[] = [];
+  transport.gimbalSet = vi.fn(async () => { order.push("move"); });
+  // Overrides the default fake's zoom-echoing zoomSet, so the settle poll below
+  // would otherwise never see the target arrive — this test only cares about
+  // ordering, so give it a short settle bound rather than burning the default 3s.
+  transport.zoomSet = vi.fn(async () => { order.push("zoom"); });
+  const tools = createTools(makeFakeMgr(transport), undefined, false, {}, FAST_ZOOM_SETTLE);
+  const tool = findTool(tools, "obsbot_zoom_to_fit");
+  const r = (await tool.handler({ x: 720, y: 405, width: 480, height: 270, ...FULL_FRAME })) as {
+    ok: boolean;
+  };
+  expect(r.ok).toBe(true);
+  expect(order).toEqual(["move", "zoom"]);
+});
+
+test("an over-the-top region centre is refused without moving or zooming", async () => {
+  // Same geometry as obsbot_aim_at_pixel's over-the-top test, ported to this
+  // suite's 1920x1080 fixture: current pose yaw 0 / pitch 85 (tilt.value =
+  // -85). The frame's bottom-centre point (u=0, v=1) resolves past vertical
+  // regardless of frame width, so a region centred there must refuse too.
+  const transport = makeFakeTransport();
+  transport.camCtrlGet = vi.fn(async (p: number) => ({ value: p === 0 ? 0 : -85, flags: 0 }));
+  const tool = findTool(createTools(makeFakeMgr(transport)), "obsbot_zoom_to_fit");
+  // Region (860,1060,200,20) centres on (960,1070), near the frame's
+  // bottom-centre (960,1080), while staying strictly inside the frame itself.
+  const r = (await tool.handler({ x: 860, y: 1060, width: 200, height: 20, ...FULL_FRAME })) as {
+    ok: boolean; error: string;
+  };
+  expect(r.ok).toBe(false);
+  expect(r.error).toMatch(/vertical/i);
+  expect(transport.gimbalSet).not.toHaveBeenCalled();
+  expect(transport.zoomSet).not.toHaveBeenCalled();
+});
+
+test("active AI tracking is refused, naming the mode, and never zooms", async () => {
+  const transport = makeFakeTransport();
+  transport.recvStatus = vi.fn(async () => {
+    const b = Buffer.from(HEALTHY_STATUS_AWAKE);
+    b[0x18] = 2;
+    b[0x1c] = 0;
+    return b;
+  });
+  const tool = findTool(createTools(makeFakeMgr(transport)), "obsbot_zoom_to_fit");
+  const r = (await tool.handler({ x: 720, y: 405, width: 480, height: 270, ...FULL_FRAME })) as {
+    ok: boolean; error: string;
+  };
+  expect(r.ok).toBe(false);
+  expect(r.error).toMatch(/track/i);
+  expect(transport.gimbalSet).not.toHaveBeenCalled();
+  expect(transport.zoomSet).not.toHaveBeenCalled();
+});
+
+test("a fake whose zoomPercent never reaches the target returns settled:false rather than hanging or throwing", async () => {
+  const transport = makeFakeTransport();
+  // zoomPercent is pinned at 0 (block[0x04]) no matter what was commanded —
+  // the ramp never arrives.
+  transport.recvStatus = vi.fn(async () => {
+    const b = Buffer.from(HEALTHY_STATUS_AWAKE);
+    b[0x04] = 0;
+    return b;
+  });
+  const tools = createTools(makeFakeMgr(transport), undefined, false, {}, FAST_ZOOM_SETTLE);
+  const tool = findTool(tools, "obsbot_zoom_to_fit");
+  // This region fits at magnification 3.6364 (ratio 1.8788, target zoomPercent
+  // ~87.88), which the pinned-zero fake will never report.
+  const r = (await tool.handler({ x: 720, y: 405, width: 480, height: 270, ...FULL_FRAME })) as {
+    ok: boolean; settled: boolean;
+  };
+  expect(r.ok).toBe(true);
+  expect(r.settled).toBe(false);
+});
+
+// IMPORTANT 1: a transposed frame is undetectable and silently frames the wrong
+// thing. obsbot_zoom_to_fit shares obsbot_aim_at_pixel's 16:9 guard (see that
+// tool's "a non-16:9 frame is refused as a transposition or typo" test above) —
+// this pins that it's actually wired up here too, not just claimed in the docs.
+test("a non-16:9 frame is refused as a transposition or typo, before any move or zoom", async () => {
+  const transport = makeFakeTransport();
+  const tool = findTool(createTools(makeFakeMgr(transport)), "obsbot_zoom_to_fit");
+  // A 1920x1080 snapshot transposed to frameWidth:1080, frameHeight:1920 — this
+  // would also flip which axis Math.min(frameWidth/width, frameHeight/height)
+  // selects, so an undetected transposition frames the wrong region at the wrong
+  // zoom while still reporting ok:true.
+  const r = (await tool.handler({
+    x: 720, y: 405, width: 480, height: 270, frameWidth: 1080, frameHeight: 1920,
+  })) as { ok: boolean; error: string };
+  expect(r.ok).toBe(false);
+  expect(r.error).toMatch(/16:9|aspect/i);
+  expect(transport.gimbalSet).not.toHaveBeenCalled();
+  expect(transport.zoomSet).not.toHaveBeenCalled();
+});
+
+// MINOR 4: the camera-was-asleep and undecodable-fovMode refusals had no
+// dedicated test, mirroring obsbot_aim_at_pixel's equivalent tests above ("a
+// sleeping camera is woken, then refused..." and "an unrecognised FOV mode is
+// refused rather than guessed").
+test("a sleeping camera is woken, then refused — the wake invalidated the caller's frame", async () => {
+  const transport = makeFakeTransport();
+  let first = true;
+  transport.recvStatus = vi.fn(async () => {
+    if (first) { first = false; return HEALTHY_STATUS_ASLEEP; }
+    return HEALTHY_STATUS_AWAKE;
+  });
+  const tool = findTool(createTools(makeFakeMgr(transport)), "obsbot_zoom_to_fit");
+  const r = (await tool.handler({ x: 720, y: 405, width: 480, height: 270, ...FULL_FRAME })) as {
+    ok: boolean; error: string;
+  };
+  expect(r.ok).toBe(false);
+  expect(r.error).toMatch(/fresh snapshot/i);
+  expect(transport.gimbalSet).not.toHaveBeenCalled();
+  expect(transport.zoomSet).not.toHaveBeenCalled();
+});
+
+test("an unrecognised FOV mode is refused rather than guessed, and never zooms", async () => {
+  const transport = makeFakeTransport();
+  transport.recvStatus = vi.fn(async () => {
+    const b = Buffer.from(HEALTHY_STATUS_AWAKE);
+    b[0x11] = 9; // no known FovType maps to this
+    return b;
+  });
+  const tool = findTool(createTools(makeFakeMgr(transport)), "obsbot_zoom_to_fit");
+  const r = (await tool.handler({ x: 720, y: 405, width: 480, height: 270, ...FULL_FRAME })) as {
+    ok: boolean; error: string;
+  };
+  expect(r.ok).toBe(false);
+  expect(transport.gimbalSet).not.toHaveBeenCalled();
+  expect(transport.zoomSet).not.toHaveBeenCalled();
+});
+
+// MINOR 3: a transient status-read failure inside the settle loop must resolve
+// to settled:false rather than throwing — by this point the gimbal move and the
+// zoom write have already happened, so throwing would lose the target/ratio the
+// caller needs to know what the camera just did.
+test("a status read that throws during the settle poll resolves to settled:false, not a thrown error", async () => {
+  const transport = makeFakeTransport();
+  // The first three recvStatus calls (the readiness gate's awake probe, then the
+  // PAIR readSteadyStatus takes to decide the zoom is not mid-ramp) must still
+  // succeed — only the reads INSIDE the settle loop, which runs after the gimbal
+  // move and zoom write, should throw. That is the state this finding is about:
+  // by the time this throws, the tool has already committed the moves it needs to
+  // report.
+  let calls = 0;
+  transport.recvStatus = vi.fn(async () => {
+    calls += 1;
+    if (calls <= 3) return HEALTHY_STATUS_AWAKE;
+    throw new Error("transient USB read failure");
+  });
+  const tools = createTools(makeFakeMgr(transport), undefined, false, {}, FAST_ZOOM_SETTLE);
+  const tool = findTool(tools, "obsbot_zoom_to_fit");
+  const r = (await tool.handler({ x: 720, y: 405, width: 480, height: 270, ...FULL_FRAME })) as {
+    ok: boolean; settled: boolean; target: { yaw: number }; ratio: number;
+  };
+  expect(r.ok).toBe(true);
+  expect(r.settled).toBe(false);
+  expect(r.target).toBeDefined();
+  expect(r.ratio).toBeCloseTo(1.8788, 4);
+  expect(transport.gimbalSet).toHaveBeenCalled();
+  expect(transport.zoomSet).toHaveBeenCalled();
+});
+
+// --- a zoom in motion invalidates the frame ---
+//
+// obsbot_aim_at_pixel and obsbot_zoom_to_fit both derive magnification from a LIVE
+// status read, so a zoom still ramping when they read it hands them a magnification
+// the frame was never captured at. The ramp is not brief — measured 2026-07-25 on
+// hardware, a full ratio 1->2 sweep takes ~2.4s at roughly 42 percentage points per
+// second — so this is a wide window, not a race you have to be unlucky to hit.
+//
+// Waiting is not the fix. The frame was captured at whatever magnification the ramp
+// had reached at that instant, and no amount of settling afterwards makes those
+// pixels mean something else. So these refuse, exactly as they already refuse a
+// camera that had to be woken "because waking moves the gimbal and invalidates the
+// frame you measured". A moving zoom invalidates it the same way.
+//
+// motionPollMs:0 keeps the beat between the two reads out of the test clock; the
+// fake changes its reading on the second read regardless of the wait.
+const FAST_MOTION = { motionPollMs: 0 };
+
+// A transport whose zoomPercent advances on EVERY status read — what a ramp in
+// flight looks like from here. It has to keep moving rather than change once,
+// because the readiness gate takes its own status read before the handler does:
+// a one-shot change would have already happened by the time the pair that
+// matters is read, and the guard would see two identical values.
+// stepPct 0 is a settled zoom.
+function makeRampingTransport(startPct: number, stepPct: number) {
+  const t = makeFakeTransport();
+  let n = 0;
+  t.recvStatus = vi.fn(async () => {
+    const b = Buffer.from(HEALTHY_STATUS_AWAKE);
+    b[0x04] = startPct + stepPct * n++;
+    return b;
+  });
+  return t;
+}
+
+test("aim_at_pixel refuses while the zoom is still ramping", async () => {
+  const transport = makeRampingTransport(20, 11);
+  const tool = findTool(
+    createTools(makeFakeMgr(transport), undefined, false, {}, FAST_MOTION),
+    "obsbot_aim_at_pixel",
+  );
+  const r = (await tool.handler({ x: 960, y: 540, frameWidth: 1920, frameHeight: 1080 })) as {
+    ok: boolean; error: string;
+  };
+  expect(r.ok).toBe(false);
+  expect(r.error).toMatch(/zoom/i);
+  // The refusal must be actionable: it has to say the frame is stale, not just
+  // that something moved, or the caller retries with the same stale pixels.
+  expect(r.error).toMatch(/fresh snapshot/i);
+  // And it must refuse BEFORE moving anything.
+  expect(transport.gimbalSet).not.toHaveBeenCalled();
+});
+
+test("zoom_to_fit refuses while the zoom is still ramping", async () => {
+  const transport = makeRampingTransport(20, 11);
+  const tool = findTool(
+    createTools(makeFakeMgr(transport), undefined, false, {}, FAST_MOTION),
+    "obsbot_zoom_to_fit",
+  );
+  const r = (await tool.handler({
+    x: 720, y: 405, width: 480, height: 270, frameWidth: 1920, frameHeight: 1080,
+  })) as { ok: boolean; error: string };
+  expect(r.ok).toBe(false);
+  expect(r.error).toMatch(/zoom/i);
+  expect(transport.gimbalSet).not.toHaveBeenCalled();
+  expect(transport.zoomSet).not.toHaveBeenCalled();
+});
+
+test("a steady zoom still aims — the guard costs nothing when nothing is moving", async () => {
+  const transport = makeRampingTransport(35, 0);
+  const tool = findTool(
+    createTools(makeFakeMgr(transport), undefined, false, {}, FAST_MOTION),
+    "obsbot_aim_at_pixel",
+  );
+  const r = (await tool.handler({ x: 1200, y: 400, frameWidth: 1920, frameHeight: 1080 })) as {
+    ok: boolean;
+  };
+  expect(r.ok).toBe(true);
+  expect(transport.gimbalSet).toHaveBeenCalled();
+});
+
+// --- the writers report whether the ramp finished ---
+//
+// obsbot_zoom_to_fit already returns `settled`. The plain zoom tools returning
+// immediately is what lets a caller chain zoom -> aim and get the refusal above,
+// so they report the same thing on the same terms.
+
+test("zoom_uvc reports settled once the zoom arrives", async () => {
+  const transport = makeFakeTransport();
+  const tool = findTool(createTools(makeFakeMgr(transport)), "obsbot_zoom_uvc");
+  const r = (await tool.handler({ ratio: 1.5 })) as { ok: boolean; ratio: number; settled: boolean };
+  expect(r.ok).toBe(true);
+  expect(r.ratio).toBeCloseTo(1.5, 4);
+  expect(r.settled).toBe(true);
+});
+
+test("zoom_uvc reports settled:false rather than lying when the zoom never arrives", async () => {
+  const transport = makeFakeTransport();
+  // A device that acknowledges the write but never moves: zoomPercent stays 0.
+  transport.zoomSet = vi.fn(async (_units: number) => {});
+  const tool = findTool(
+    createTools(makeFakeMgr(transport), undefined, false, {}, { pollMs: 1, timeoutMs: 5 }),
+    "obsbot_zoom_uvc",
+  );
+  const r = (await tool.handler({ ratio: 2.0 })) as { ok: boolean; settled: boolean };
+  expect(r.ok).toBe(true);
+  expect(r.settled).toBe(false);
+});
+
+// --- declaring which feed a frame came from ---
+//
+// These tools turn a pixel into an angle using the CAMERA's optics, but they only
+// ever receive pixels. Nothing in x/y/frameWidth/frameHeight says which feed the
+// frame came from, so a frame that OBSBOT Center or OBS has reframed produces a
+// confidently wrong aim with ok:true. Until now the constraint lived only in prose
+// — the README and CHANGELOG both claimed these "refuse" virtual/ndi frames, which
+// they could not, having no way to tell.
+//
+// A blanket refusal would be wrong too: a feed configured as a true pass-through
+// aims correctly, verified on hardware against an NDI chain. So the caller
+// DECLARES the feed, `device` by default, and a non-device declaration comes back
+// in the result with the assumption it rests on stated explicitly.
+
+test("aim_at_pixel defaults to the device feed and says so", async () => {
+  const transport = makeFakeTransport();
+  const tool = findTool(
+    createTools(makeFakeMgr(transport), undefined, false, {}, FAST_MOTION),
+    "obsbot_aim_at_pixel",
+  );
+  const r = (await tool.handler({ x: 1200, y: 400, frameWidth: 1920, frameHeight: 1080 })) as
+    { ok: boolean; source: string; note?: string };
+  expect(r.ok).toBe(true);
+  expect(r.source).toBe("device");
+  expect(r.note).toBeUndefined();
+});
+
+test("aim_at_pixel accepts a declared alternative feed, and states what it is assuming", async () => {
+  const transport = makeFakeTransport();
+  const tool = findTool(
+    createTools(makeFakeMgr(transport), undefined, false, {}, FAST_MOTION),
+    "obsbot_aim_at_pixel",
+  );
+  const r = (await tool.handler({
+    x: 1200, y: 400, frameWidth: 1920, frameHeight: 1080, source: "ndi",
+  })) as { ok: boolean; source: string; note: string };
+  expect(r.ok).toBe(true);
+  expect(r.source).toBe("ndi");
+  expect(r.note).toMatch(/pass-through/i);
+  // It still aims — the declaration is not a refusal.
+  expect(transport.gimbalSet).toHaveBeenCalled();
+});
+
+test("zoom_to_fit carries the same declaration", async () => {
+  const transport = makeFakeTransport();
+  const tool = findTool(
+    createTools(makeFakeMgr(transport), undefined, false, {}, FAST_MOTION),
+    "obsbot_zoom_to_fit",
+  );
+  const r = (await tool.handler({
+    x: 720, y: 405, width: 480, height: 270, ...FULL_FRAME, source: "virtual",
+  })) as { ok: boolean; source: string; note: string };
+  expect(r.ok).toBe(true);
+  expect(r.source).toBe("virtual");
+  expect(r.note).toMatch(/pass-through/i);
+});

@@ -1,0 +1,2147 @@
+import { z } from "zod";
+import {
+  encodeSetRunStatus,
+  zoomRatioToUnits,
+  encodeAiTrackSpeed,
+  encodeAiTracking,
+  encodeAiMode,
+  encodeFaceAe,
+  encodeVendorProbe,
+  encodeVendorGet,
+  encodeZoomWithSpeed,
+  encodeFaceFocus,
+  encodeSetExposure,
+  encodeGetExposureRange,
+  decodeExposureRange,
+  decodeStatus,
+  encodeFov,
+  encodeHdr,
+  percentToRange,
+  rangeToPercent,
+  AI_FRAMING_MODES,
+  AI_SCENE_MODES,
+  AI_TRACK_SPEEDS,
+  FOV_TYPES,
+  UVC_XU_SELECTOR,
+  CAMERA_CONTROL_PAN,
+  CAMERA_CONTROL_TILT,
+  CAMERA_CONTROL_FOCUS,
+  VIDEO_PROCAMP_WHITE_BALANCE,
+  IMAGE_CONTROL_PROP,
+  IMAGE_CONTROLS,
+  UVC_FLAG_AUTO,
+  UVC_FLAG_MANUAL,
+} from "../codec/commands.js";
+import type { AiTrackSpeed, AiFramingMode, AiSceneMode, AiModeStatus, FovType, ImageControl } from "../codec/commands.js";
+import {
+  aimAtPixel,
+  GIMBAL_YAW_LIMIT_DEG,
+  GIMBAL_PITCH_LIMIT_DEG,
+  FOV_MAGNIFICATION,
+  magnificationFromZoomRatio,
+  zoomRatioFromMagnification,
+  MIN_MAGNIFICATION,
+  MAX_MAGNIFICATION,
+} from "../geometry/aim.js";
+import { verifyFraming } from "./framing.js";
+import { parseFrame } from "../codec/frame.js";
+import { OP_BY_NAME } from "../codec/opcodes.js";
+import {
+  decodePresetList,
+  decodePresetEntry,
+  assemblePresetSlots,
+  implausiblePresetListReason,
+  encodePresetAdd,
+  encodePresetUpdate,
+  encodePresetRecall,
+  encodePresetDelete,
+  encodePresetSetName,
+} from "../codec/preset.js";
+import type { PresetSlot, PresetPose } from "../codec/preset.js";
+import { ObsbotTransport, CameraBusyError } from "../transport/transport.js";
+import { DeviceManager } from "../device/manager.js";
+import { ensureReady, msg } from "./ready.js";
+import type { ReadyResult, ReconnectCtl } from "./ready.js";
+import type { CaptureManager } from "../capture/manager.js";
+import type { CaptureSource } from "../capture/ffmpeg-args.js";
+import { CaptureError } from "../capture/manager.js";
+
+export interface ToolDef {
+  name: string;
+  description: string;
+  schema: z.ZodTypeAny;
+  handler: (args: unknown) => Promise<object>;
+}
+
+const clamp = (value: number, min: number, max: number): number =>
+  Math.min(max, Math.max(min, value));
+
+/**
+ * Why {@link resolveMagnification} could not resolve a usable magnification.
+ * Carried explicitly rather than left for the caller to re-derive from
+ * `status.fovMode`, because that re-derivation is exactly the trap this type
+ * exists to close: it was correct for the two reasons that existed when it was
+ * written (an "if unknown, else assume corrupt zoom" fallthrough), but is not
+ * exhaustive — a third reason added later would silently be mislabelled as
+ * "implausible-zoom" by every caller doing that inference independently. One
+ * function decides the reason so there is exactly one place that has to be
+ * right.
+ */
+export type MagnificationResult =
+  | { ok: true; magnification: number }
+  | { ok: false; reason: "unknown-fov" }
+  | { ok: false; reason: "implausible-zoom"; zoomPercent: number };
+
+/**
+ * The camera's total magnification relative to wide, from its reported state.
+ *
+ * A discrete FOV mode and a continuous zoom are two ways of writing to one
+ * scale, so this returns one number either way. Fails (`ok: false`) for
+ * anything that cannot be trusted:
+ *  - `reason: "unknown-fov"` — the status byte didn't decode, a state to
+ *    refuse on rather than guess at.
+ *  - `reason: "implausible-zoom"` — a `"custom"` mode whose derived
+ *    magnification falls outside the camera's known range
+ *    [MIN_MAGNIFICATION, MAX_MAGNIFICATION] — a corrupt or implausible
+ *    `zoomPercent` reading (e.g. a garbled status byte reporting
+ *    zoomPercent > 100). Callers should refuse rather than pass this through:
+ *    the geometry module's own guard (halfAngleTangents in src/geometry/aim.ts)
+ *    would otherwise be the only thing standing between a bad reading and a
+ *    silently wrong — or NaN/Infinity — aim.
+ */
+export function resolveMagnification(
+  status: { fovMode: FovType | "custom" | "unknown"; zoomPercent: number },
+): MagnificationResult {
+  if (status.fovMode === "unknown") return { ok: false, reason: "unknown-fov" };
+  if (status.fovMode === "custom") {
+    const m = magnificationFromZoomRatio(1 + status.zoomPercent / 100);
+    if (!Number.isFinite(m) || m < MIN_MAGNIFICATION || m > MAX_MAGNIFICATION) {
+      return { ok: false, reason: "implausible-zoom", zoomPercent: status.zoomPercent };
+    }
+    return { ok: true, magnification: m };
+  }
+  return { ok: true, magnification: FOV_MAGNIFICATION[status.fovMode] };
+}
+
+/**
+ * Refuse a frameWidth/frameHeight pair that isn't 16:9. Shared by
+ * `obsbot_aim_at_pixel` and `obsbot_zoom_to_fit` — both take frame dimensions
+ * from the same `obsbot_capture_snapshot` result, and both are equally exposed
+ * to a caller that swaps width and height.
+ *
+ * 16:9 is preserved by the capture path at every resolution (verified at
+ * 256x144, 1280x720, 1920x1080), so a non-16:9 pair did not come from that path
+ * as-is — it was transposed (width/height swapped) or came from somewhere else
+ * entirely, since passing the values through unchanged always yields 16:9. For
+ * `obsbot_zoom_to_fit` a transposed pair is worse than a bad aim: it also flips
+ * which axis `Math.min(frameWidth/width, frameHeight/height)` selects, so the
+ * camera would frame the wrong region at the wrong zoom while still reporting
+ * `ok: true`.
+ */
+function refuseIfNot169(frameWidth: number, frameHeight: number): { ok: false; error: string } | null {
+  if (Math.abs(frameWidth / frameHeight - 16 / 9) > 0.02) {
+    return {
+      ok: false,
+      error:
+        `frame ${frameWidth}x${frameHeight} is not 16:9, but obsbot_capture_snapshot always ` +
+        `returns 16:9 frames. This looks like frameWidth/frameHeight were transposed, or came ` +
+        `from something other than that tool's result.`,
+    };
+  }
+  return null;
+}
+
+// Some MCP clients serialize numbers and booleans as strings when the advertised
+// inputSchema lacks type info. We now advertise a proper JSON Schema (see
+// mcp/server.ts), but also accept string-encoded values defensively so the tools
+// work with any client. Booleans are coerced EXPLICITLY — z.coerce.boolean()
+// maps any non-empty string (including "false") to true, which would be a bug.
+const num = () =>
+  z.preprocess(
+    (v) => (typeof v === "string" && v.trim() !== "" && !Number.isNaN(Number(v)) ? Number(v) : v),
+    z.number(),
+  );
+const bool = () =>
+  z.preprocess(
+    (v) => (v === "true" ? true : v === "false" ? false : v),
+    z.boolean(),
+  );
+
+// Optional per-camera selector, shared by every camera-addressing tool. The value
+// is the camera's serial; the handler forwards it to DeviceManager.get(serial)
+// (via getTransport/gate) so the command targets that camera. Omitted + a single
+// camera attached resolves to that camera, so single-camera callers are unaffected.
+// EXEMPT tools (obsbot_devices, obsbot_capture_stop/list, obsbot_debug_probe) keep
+// a plain z.object and never advertise `camera`.
+const withCamera = <T extends z.ZodRawShape>(shape: T) =>
+  z.object({ ...shape, camera: z.string().optional() });
+
+const listDevicesSchema = z.object({});
+const wakeSchema = withCamera({});
+const sleepSchema = withCamera({});
+const ptzMoveAngleSchema = withCamera({
+  yaw: num(),
+  pitch: num(),
+  roll: num().default(0),
+});
+const ptzMoveSpeedSchema = withCamera({
+  yaw: num(),
+  pitch: num(),
+  roll: num().default(0),
+  autoStopMs: num().default(800),
+});
+const gimbalRecenterSchema = withCamera({});
+const zoomAbsoluteSchema = withCamera({ ratio: num() });
+
+// mode covers the human framings AND the standalone scene modes (group/whiteboard/
+// desk/hand). For a framing, enable = human tracking with that framing; for a scene
+// mode, `enabled` is implied true (disable via enabled:false, which cancels tracking).
+const AI_TRACKING_MODES = [...AI_FRAMING_MODES, ...AI_SCENE_MODES];
+const aiTrackingSchema = withCamera({
+  enabled: bool(),
+  mode: z.enum(AI_TRACKING_MODES as [string, ...string[]]).default("normal"),
+});
+const isSceneMode = (m: string): m is AiSceneMode => (AI_SCENE_MODES as string[]).includes(m);
+const aiTrackSpeedSchema = withCamera({
+  speed: z.enum(AI_TRACK_SPEEDS as [AiTrackSpeed, ...AiTrackSpeed[]]),
+});
+const zoomSpeedSchema = withCamera({
+  ratio: num(),
+  speed: num().default(0),
+});
+const faceFocusSchema = withCamera({ enabled: bool() });
+const voiceControlSchema = withCamera({
+  command: z.enum(["wake", "sleep", "track", "unlock", "zoom-in", "zoom-out", "presets"]),
+  enabled: bool(),
+});
+const voiceLanguageSchema = withCamera({ language: z.enum(["english", "chinese"]) });
+const gestureControlSchema = withCamera({
+  gesture: z.enum(["target", "zoom", "dynamic-zoom", "mirror"]), enabled: bool(),
+});
+const getStatusSchema = withCamera({});
+// Generic RE/spelunking primitive: raw send-bytes / get-bytes on any XU selector,
+// plus a `query` convenience that frames a table opcode and reads the reply.
+const probeSchema = z.object({
+  mode: z.enum(["get", "set", "query"]),
+  selector: num().pipe(z.number().int().min(0).max(255)).optional(),
+  length: num().pipe(z.number().int().min(1).max(1024)).optional(),
+  hex: z.string().optional(),        // raw bytes for mode "set"
+  opcode: z.string().optional(),     // table opcode name for mode "query"
+  payloadHex: z.string().optional(), // nested payload for mode "query"
+});
+// Vendor XU selector: SET_CUR request AND GET_CUR reply mailbox. Protocol
+// constant, not platform-specific — same value as the per-transport
+// VENDOR_XU_SELECTOR (transport/{macos,linux,windows,read-serial}.ts), kept
+// local here rather than imported so this module doesn't need a transport-layer
+// dependency for one constant.
+const PROBE_VENDOR_SELECTOR = 0x02;
+// The reply mailbox retains the PREVIOUS reply until the new one lands, so a
+// single unvalidated read can return stale data — same hazard readSerialVia
+// (transport/read-serial.ts) polls around. Mirrors its POLL_ATTEMPTS.
+const PROBE_QUERY_POLL_ATTEMPTS = 8;
+// ...and its POLL_DELAY_MS. The device does not populate the mailbox instantly, and
+// how long it takes depends on the opcode: cached state (AI_GET_QUICK_STATUS) comes
+// back sub-millisecond, but anything reading persistent storage (UG_GET_SN) is far
+// slower. An un-delayed loop spans only ~1-2ms end to end, so it polls entirely
+// within the gap and reports "no valid reply" for a command the device answered.
+// Measured on darwin-arm64 hardware 2026-07-21, UG_GET_SN over 25 trials:
+// no delay = 24 failures (96%), 30ms delay = 0. f27956f fixed exactly this in
+// read-serial.ts; the probe kept the un-delayed loop until 2026-07-21.
+const PROBE_QUERY_POLL_DELAY_MS = 30;
+// Max gimbal velocity accepted by obsbot_gimbal_move_speed, in degrees per
+// second. Hardware-measured 2026-07-21: 150/160/170 all drove the gimbal
+// linearly, while 180/200/300 each moved it EXACTLY 0° yet still reported
+// success — the firmware ignores an over-range speed rather than saturating.
+// The true cutoff lies somewhere in 170..180; 150 keeps margin under it and
+// matches obsbot_gimbal_move's yaw bound.
+const GIMBAL_MAX_SPEED_DPS = 150;
+const fovSchema = withCamera({ fov: z.enum(FOV_TYPES as [FovType, ...FovType[]]) });
+const hdrSchema = withCamera({ enabled: bool() });
+const focusAutoSchema = withCamera({});
+const focusManualSchema = withCamera({
+  position: num().pipe(z.number().min(0).max(100)).default(50),
+});
+const imageWbAutoSchema = withCamera({});
+const imageWbManualSchema = withCamera({ temperature: num().default(5000) });
+const imageControlSchema = withCamera({
+  control: z.enum(IMAGE_CONTROLS as [ImageControl, ...ImageControl[]]),
+  level: num().pipe(z.number().min(0).max(100)),
+});
+const imageExposureAutoSchema = withCamera({
+  // Auto-exposure metering priority: global (whole frame) or face (meters for a
+  // detected face). Optional.
+  priority: z.enum(["global", "face"]).optional(),
+});
+const imageExposureManualSchema = withCamera({
+  level: num().pipe(z.number().min(0).max(100)).default(50),
+});
+const gimbalPositionSchema = withCamera({});
+const captureSourceEnum = z.enum(["device", "virtual", "ndi"]);
+
+// `source` is a DECLARATION, not a selector: these tools never fetch a frame, they
+// are handed one. It exists because the frame's origin is otherwise unknowable —
+// see frameSourceNote — and it defaults to `device`, which is what every caller
+// got implicitly before.
+const aimAtPixelSchema = withCamera({
+  x: num().pipe(z.number().finite()),
+  y: num().pipe(z.number().finite()),
+  frameWidth: num().pipe(z.number().finite().min(1)),
+  frameHeight: num().pipe(z.number().finite().min(1)),
+  source: captureSourceEnum.default("device"),
+});
+// width/height/x/y are deliberately unconstrained beyond "finite": a negative
+// width or an off-frame region is a valid INPUT (the schema's job), just not a
+// valid REGION (the handler's job, so it can return a structured ok:false with
+// the reason instead of a schema parse throw — matching how aimAtPixelSchema's
+// own x/y-in-frame check works one level up, in the handler, not the schema).
+const zoomToFitSchema = withCamera({
+  x: num().pipe(z.number().finite()),
+  y: num().pipe(z.number().finite()),
+  width: num().pipe(z.number().finite()),
+  height: num().pipe(z.number().finite()),
+  frameWidth: num().pipe(z.number().finite().min(1)),
+  frameHeight: num().pipe(z.number().finite().min(1)),
+  margin: num().pipe(z.number().finite().min(0)).default(0.1),
+  source: captureSourceEnum.default("device"),
+});
+const presetListSchema = withCamera({});
+const presetSlotValueSchema = () =>
+  num()
+    .pipe(z.union([z.literal(1), z.literal(2), z.literal(3)]))
+    // Keep the runtime parser's coercion/validation while exposing the actual
+    // Tiny 2 slot contract to MCP clients through draft-07 JSON Schema.
+    .meta({ type: "integer", enum: [1, 2, 3], minimum: 1, maximum: 3 });
+const presetSaveSchema = withCamera({
+  slot: presetSlotValueSchema(),
+});
+const presetSlotSchema = withCamera({
+  slot: presetSlotValueSchema(),
+});
+const presetRecallSchema = presetSlotSchema;
+const presetUpdateSchema = withCamera({
+  slot: presetSlotValueSchema(),
+});
+const presetRenameSchema = withCamera({
+  slot: presetSlotValueSchema(),
+  name: z.string(),
+});
+const presetDeleteSchema = presetSlotSchema;
+// Rename frame payload is u32le(slot-1) [4 bytes] + ASCII name, inside a fixed 60-byte
+// frame whose payload region starts at offset 16 (see buildFrame). Max payload is
+// 60-16=44 bytes, so the name must fit in 44-4=40 bytes.
+const PRESET_NAME_MAX = 40;
+// `resolution` is the longest edge of the returned image, in pixels. It replaces
+// the old `maxDim`, and the default drops from 1024 to 640: the JPEG is base64'd
+// into a tool response that an LLM reads, so every pixel costs tokens. 640 is
+// enough to judge framing, lighting and exposure; a caller that needs detail asks
+// for it, and pays for it (640 -> ~86KB, 1920 -> ~413KB).
+//
+// Capped at 1920 even though the sensor offers 3840x2160. Reaching 4K needs an
+// explicit device activeFormat change (the session preset alone does not do it --
+// activeFormat governs and stays at 1080p), which mutates shared device state that
+// another app streaming the camera would feel. And a 4K frame is ~1.5MB, roughly
+// 2M base64 characters, which is far past a usable token budget for "let me look
+// at the shot". The cap is honest: asking for more than the ceiling is rejected
+// rather than silently answered with 1080p.
+const snapshotSchema = withCamera({
+  resolution: num().pipe(z.number().min(256).max(1920)).default(640),
+  quality: num().pipe(z.number().min(1).max(100)).default(80),
+  // Ceiling raised from 5000 on 2026-07-25. A source that connects lazily needs
+  // longer than a UVC camera does to hand over its first frame — NDI Webcam Input
+  // measured 4-5s — and 5000 sat right on that threshold, so the one value that
+  // worked was also the largest the schema allowed. The helper now budgets its
+  // own grace period on top of this, so callers rarely need to raise it at all;
+  // the headroom is for the genuinely slow case rather than the normal one.
+  settleMs: num().pipe(z.number().min(0).max(15000)).default(600),
+  source: z.enum(["device", "virtual", "ndi"]).default("device"),
+});
+
+const recordStartSchema = z.object({
+  durationSec: num().pipe(z.number().positive()).optional(),
+  audio: bool().default(true),
+  outputPath: z.string().optional(),
+  source: captureSourceEnum.default("device"),
+});
+const previewStartSchema = z.object({ source: captureSourceEnum.default("device") });
+const captureStopSchema = z.object({ sessionId: z.string() });
+const captureListSchema = z.object({});
+
+// Preset read path: flat XU selectors 12 (list) + 13 (entry cursor). Hardware-verified
+// 2026-07-19 — NOT the framed-reply model (recvVendor + parseFrame); reads on the
+// vendor reply path just return the flat status block for this device. Three steps:
+//   1. GET selector 12 -> <count:u8> <slotIdx:u8> x count
+//   2. echo-write the just-read bytes back to selector 12 -> resets the entry cursor
+//      (echo is provably non-destructive; do NOT write zeros/synthesized bytes)
+//   3. GET selector 13, `count` times -> each read returns the next preset entry and
+//      advances the cursor, until the exhausted marker (status 0x02)
+//
+// Occupancy gates a create-once resource (save requires EMPTY, everything else
+// requires OCCUPIED), so a falsely-"empty" read here drives an irreversible write.
+// C1/I1/I3 below are all facets of the same unifying fix: never trust device bytes
+// enough to act on them (or echo them back) without a plausibility/consistency check.
+const isAllZero = (b: Buffer): boolean => b.equals(Buffer.alloc(b.length));
+
+// A genuinely EMPTY device and a not-serving read BOTH return an all-zero selector-12
+// block (hardware-established 2026-07-19 under controlled conditions: OBSBOT Center
+// closed so nothing could re-assert presets, camera measured awake at the moment of
+// the read, stable across repeated reads). So the block alone cannot tell them apart.
+//
+// Corroborate on the SAME XU surface and handle: the status block. When selector 12
+// read zeros on a genuinely empty device, the status block still returned real
+// non-zero data — a dead link or stale handle would zero BOTH.
+//
+// The check is deliberately TWO-part. decodeStatus reports awake for an ALL-ZERO block
+// (awake === block[0x02] === 0), so testing `awake` alone would let a dead link
+// masquerade as an empty device — manufacturing the exact false-EMPTY that gates the
+// irreversible create-once ADD. Requiring the status block to be non-zero AND awake
+// makes emptiness something we accept only on positive evidence.
+//
+// NOTE: UVC liveness is NOT valid corroboration here — obsbot_gimbal_position returns
+// a correct live pose even while the preset selectors aren't serving.
+async function presetSubsystemServing(t: ObsbotTransport): Promise<boolean> {
+  try {
+    const status = await t.recvStatus(60);
+    if (isAllZero(status)) return false;
+    return decodeStatus(status).awake;
+  } catch {
+    return false;
+  }
+}
+
+async function getPresetSlots(t: ObsbotTransport): Promise<PresetSlot[]> {
+  const block = await t.xuGetRaw(12, 60);
+  // Zero presets is a legitimate device state, and every preset tool routes through
+  // here — so refusing it outright left our toolset with no path OUT of it (save was
+  // gated behind the read that fails, making the first preset uncreatable where
+  // OBSBOT Center doesn't exist). Accept it only with positive corroboration, and
+  // skip the echo-write: with no entries there is no cursor to reset, which removes
+  // the C1 hazard at its root on this path rather than bypassing the check.
+  if (isAllZero(block) && (await presetSubsystemServing(t))) {
+    return assemblePresetSlots([]);
+  }
+  // C1: validate BEFORE the echo-write — see implausiblePresetListReason. A
+  // failed/short/garbage read must never be echoed back to a selector whose
+  // write semantics for anything but a genuine echo are undecoded.
+  const reason = implausiblePresetListReason(block);
+  if (reason) {
+    throw new Error(`preset list read implausible, refusing to reset the cursor: ${reason}`);
+  }
+  const list = decodePresetList(block);
+  await t.xuRaw(12, block); // echo-write resets the cursor — load-bearing, see above
+
+  // I3: never walk more entries than the device physically has, no matter what
+  // `count` claimed. C1 already rejects count>3 above, but this clamp is a
+  // second, independent guard against turning a garbage count into up to 255
+  // USB control transfers.
+  const walkCount = Math.min(list.count, 3);
+  const per: { slot: 1 | 2 | 3; name: string; pose: PresetPose }[] = [];
+  for (let i = 0; i < walkCount; i++) {
+    const e = decodePresetEntry(await t.xuGetRaw(13, 60));
+    if (e.end) break;
+    per.push({ slot: e.slot!, name: e.name!, pose: e.pose! });
+  }
+
+  // I1: list.slots (from selector 12) is the device's own statement of WHICH
+  // slots are occupied. If the entry-cursor walk (selector 13) disagrees — it
+  // exhausted early, hit an implausible/all-zero entry, or decoded a different
+  // slot set — don't silently trust whichever answer under-reports. A false
+  // EMPTY is the dangerous direction for a create-once resource, so fail loudly
+  // instead of returning a confident wrong answer.
+  const walked = [...new Set(per.map((e) => e.slot - 1))].sort((a, b) => a - b);
+  const claimed = [...list.slots].sort((a, b) => a - b);
+  const agree = walked.length === claimed.length && walked.every((s, i) => s === claimed[i]);
+  if (!agree) {
+    throw new Error(
+      `preset list mismatch: selector 12 claims occupied slots [${claimed.join(",")}] but the ` +
+        `entry-cursor walk (selector 13) found [${walked.join(",")}]`,
+    );
+  }
+
+  return assemblePresetSlots(per);
+}
+
+export interface PresetReadOpts {
+  attempts?: number;
+  backoffMs?: number[];
+}
+
+// This is a mechanical system: the gimbal does not switch between awake and asleep,
+// it travels through them (rising, settling, stowing), and subsystems come back
+// online in some order. A single sample of a system in motion describes one instant,
+// not the state the next call lands in — so a lone implausible read is expected
+// occasionally and is not, by itself, news.
+//
+// Backoff spans ~1.7s, chosen against the observed ~1-2s post-wake self-centering
+// window. Latency is the cheapest thing we can spend here.
+const PRESET_READ_DEFAULTS: Required<PresetReadOpts> = { attempts: 3, backoffMs: [200, 500, 1000] };
+
+const napMs = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
+
+// Pan/tilt readback is a float now (see transport/linux.ts, transport/macos.ts),
+// which can carry many more digits than the hardware's ±1° accuracy justifies —
+// e.g. 5.975277777777778 from an arc-second division. Round to 2 decimal places
+// for reporting: enough to show sub-degree structure (useful on Linux, where it
+// reflects the last commanded pose) without implying precision the readout
+// doesn't have.
+const round2 = (deg: number): number => Math.round(deg * 100) / 100;
+
+export interface PoseSettleOpts {
+  pollMs?: number;
+  timeoutMs?: number;
+  /** Beat between the two pose reads that decide whether the gimbal is moving. */
+  motionPollMs?: number;
+}
+
+// motionPollMs is the sensitivity knob, same idea as readSteadyStatus: a beat of
+// B ms detects any slew faster than POSE_STEADY_TOLERANCE_DEG * 1000/B deg/s.
+// 120ms with a 1° band => 8.3 deg/s, against a measured gimbalSet slew of ~50
+// deg/s (2026-08-21: a 90° pan took ~1.7s) — six times the threshold, while
+// costing each aim one extra pose read and 120ms.
+const POSE_SETTLE_DEFAULTS: Required<PoseSettleOpts> = {
+  pollMs: 100,
+  timeoutMs: 3000,
+  motionPollMs: 120,
+};
+// The band cannot be zero the way readSteadyStatus's is. A settled gimbal does
+// NOT read identically every time: holding position, this camera dithers by one
+// 3600 arc-second step (measured 2026-08-21: tilt read 40.0, 40.0, 41.0, 40.0
+// while mechanically stationary). One degree is that dither exactly, and the
+// hardware readout is only accurate to ±1° anyway, so a tighter band would spin
+// until the deadline on a camera that is not moving at all.
+const POSE_STEADY_TOLERANCE_DEG = 1;
+
+/**
+ * RELEASE GATE. Settling runs only where pose reads report LIVE position, decided
+ * by t.livePoseReads(): OBSBOT_LIVE_POSE forces it either way, otherwise the
+ * transport detects it (Linux probes read latency; macOS/Windows default off).
+ *
+ * The hazard readSteadyPose addresses only exists where pose reads report LIVE
+ * position. Today that is macOS always, and Linux only on a kernel carrying the
+ * uvcvideo AUTO_UPDATE fixup for 3564:fef8 or the volatile patch — neither of
+ * which is upstream yet. On a stock Linux kernel the read is a commanded echo,
+ * settling changes no result, and the only effect is +motionPollMs on every aim
+ * and preset write. So the default stays off and shipped behaviour is unchanged
+ * on every platform.
+ *
+ * FLIP THE DEFAULT when the uvcvideo change lands upstream. Auto-detection is
+ * not available and is not worth building: the fixup restores AUTO_UPDATE
+ * WITHOUT advertising V4L2_CTRL_FLAG_VOLATILE, so the flag cannot distinguish it
+ * from a stock kernel, and the Linux helper's `flags` field carries a
+ * DirectShow-style auto/manual indicator rather than V4L2 control flags anyway.
+ *
+ * macOS is gated too, deliberately. It reads live and therefore has this bug
+ * today, but its behaviour is hardware-verified as shipped and this is not the
+ * change to unverify it in — enable the env var there once it has been exercised
+ * on Mac hardware.
+ *
+ * The same gate also enables LinuxTransport's closed-loop move retry; the flag
+ * itself lives in transport/transport.ts so both sides read one switch.
+ */
+
+/**
+ * Read the gimbal pose, and refuse to hand it back while the gimbal is still
+ * travelling.
+ *
+ * WHY THIS EXISTS. `aimAtPixel` and preset save/update do not use the pose as a
+ * report — they compose a NEW ABSOLUTE TARGET from it. A pose read mid-slew
+ * therefore does not merely look wrong, it lands the camera somewhere it was
+ * never asked to go: the composed target is short by exactly the distance the
+ * gimbal still had left to travel.
+ *
+ * This was invisible before 2026-08-21 because on Linux it could not happen.
+ * uvcvideo served CT_PANTILT_ABSOLUTE from its own cache, so a read taken during
+ * a move returned the last COMMANDED pose — the very thing the composition
+ * wanted — and the bug was masked by a driver defect. macOS has always read live
+ * and has always been exposed. Once the Linux driver reports true position (the
+ * uvcvideo AUTO_UPDATE fixup, or the pending volatile patch — see
+ * UVCVIDEO-LINUX-POSITION-2026-07-21.md), Linux is exposed too. Measured on
+ * hardware: five reads issued immediately after commanding a 90° pan returned
+ * 0.0, 18.0, 37.0, 60.0, 79.0 — five different intermediate poses, any of which
+ * would have been composed against.
+ *
+ * Correct on BOTH kernels, which is why it is unconditional rather than gated on
+ * a capability. Where the read is a cached setpoint, the two reads agree on the
+ * first beat and this returns after one `motionPollMs` with the same value the
+ * old code would have used. Where the read is live, it waits for arrival.
+ *
+ * Returns `settled` rather than throwing on timeout, matching waitForZoomSettle:
+ * a gimbal still moving after the bound is information the caller may want to
+ * act on, and the pose returned is still the freshest one available. Read
+ * failures are NOT swallowed here — unlike the zoom settle, which runs after the
+ * write it reports on, this runs BEFORE the move it feeds, and composing a
+ * target from a pose we failed to read is exactly the outcome to avoid.
+ */
+async function readSteadyPose(
+  t: ObsbotTransport,
+  opts: PoseSettleOpts = {},
+): Promise<{ yaw: number; pitch: number; settled: boolean }> {
+  const { pollMs, timeoutMs, motionPollMs } = { ...POSE_SETTLE_DEFAULTS, ...opts };
+  const deadline = Date.now() + timeoutMs;
+  // UVC pan is degrees with our yaw sign (+ = camera-left); UVC tilt is degrees
+  // but positive = up, so negate to match our +pitch = down convention. Same
+  // read path and same signs as obsbot_gimbal_position.
+  const readPose = async () => ({
+    yaw: (await t.camCtrlGet(CAMERA_CONTROL_PAN)).value,
+    pitch: -(await t.camCtrlGet(CAMERA_CONTROL_TILT)).value,
+  });
+
+  if (!(await t.livePoseReads())) {
+    // Reads are a commanded echo (or the caller forced the gate off): one read,
+    // exactly as before this helper existed. `settled` is an assumption here,
+    // not a measurement — it reports "safe to compose" because on an echo kernel
+    // it is, not because motion was checked.
+    const only = await readPose();
+    return { yaw: only.yaw, pitch: only.pitch, settled: true };
+  }
+
+  let last = await readPose();
+  for (;;) {
+    await napMs(motionPollMs);
+    const next = await readPose();
+    const steady =
+      Math.abs(next.yaw - last.yaw) <= POSE_STEADY_TOLERANCE_DEG &&
+      Math.abs(next.pitch - last.pitch) <= POSE_STEADY_TOLERANCE_DEG;
+    if (steady) return { yaw: next.yaw, pitch: next.pitch, settled: true };
+    last = next;
+    if (Date.now() >= deadline) return { yaw: next.yaw, pitch: next.pitch, settled: false };
+    await napMs(pollMs);
+  }
+}
+
+export interface ZoomSettleOpts {
+  pollMs?: number;
+  timeoutMs?: number;
+  /** Beat between the two status reads that decide whether the zoom is moving. */
+  motionPollMs?: number;
+}
+// motionPollMs is the sensitivity knob for readSteadyStatus: zoomPercent is an
+// integer, so a beat of B ms detects any ramp travelling faster than 1000/B
+// percentage points per second. 80ms => 12.5 pt/s, against a measured UVC ramp of
+// ~42 pt/s (2026-07-25: a full ratio 1->2 sweep took 2397ms) — comfortable margin,
+// while costing every aim only one extra status read and 80ms.
+const ZOOM_SETTLE_DEFAULTS: Required<ZoomSettleOpts> = {
+  pollMs: 100,
+  timeoutMs: 3000,
+  motionPollMs: 80,
+};
+// zoomPercent tracks the zoom's actual travel, not the commanded value, which is
+// what makes it a usable arrival signal — a status read taken right after
+// commanding the write can catch it mid-ramp (observed: commanding ratio 1.5
+// read back zoomPercent 33 in transit before settling at 50). zoomPercent is on
+// the SAME 0-100 scale resolveMagnification reads it on (ratio = 1 + pct/100),
+// so the target is expressed on that scale too, not the raw device units
+// zoomSet takes (those come from zoomRange(), which can differ per device).
+const ZOOM_SETTLE_TOLERANCE_PCT = 1;
+
+/**
+ * Poll the status block until `zoomPercent` shows the zoom has actually arrived
+ * at `targetRatio`, or give up after the bound. Returns false rather than
+ * throwing on timeout: a camera moving slower than expected (or a hardware zoom
+ * that overshoots/undershoots slightly) is information the caller needs, not a
+ * failure — the caller decides what to do with `settled:false`, this function
+ * just refuses to lie about it.
+ *
+ * A transient read failure inside the loop is swallowed the same way: by the
+ * time this runs, the gimbal move and the zoom write have already happened, so
+ * throwing here would lose the `target`/`ratio` the caller needs to know what
+ * the camera just did. A read that throws is treated as "not settled yet" —
+ * the loop keeps polling until the deadline and resolves `false` rather than
+ * rejecting, so the tool still returns its normal result.
+ */
+async function waitForZoomSettle(
+  t: ObsbotTransport,
+  targetRatio: number,
+  opts: ZoomSettleOpts = {},
+): Promise<boolean> {
+  const { pollMs, timeoutMs } = { ...ZOOM_SETTLE_DEFAULTS, ...opts };
+  const targetPct = (targetRatio - 1) * 100;
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    try {
+      const status = decodeStatus(await t.recvStatus());
+      if (Math.abs(status.zoomPercent - targetPct) <= ZOOM_SETTLE_TOLERANCE_PCT) return true;
+    } catch {
+      // Transient read failure — treat as not-yet-settled rather than propagating.
+    }
+    if (Date.now() >= deadline) return false;
+    await napMs(pollMs);
+  }
+}
+
+/**
+ * Read the status block, and refuse to hand it back if the zoom moved while we
+ * were looking at it.
+ *
+ * `obsbot_aim_at_pixel` and `obsbot_zoom_to_fit` turn a pixel into an angle using
+ * a magnification read live from this block. If the zoom is mid-ramp, that read
+ * describes a magnification the caller's frame was never captured at, and the
+ * angle comes out wrong in proportion — up to 4x, which is degrees to tens of
+ * degrees of mis-aim, reported as a clean success.
+ *
+ * The window is wide, not a narrow race: measured 2026-07-25, a full ratio 1->2
+ * sweep takes ~2.4s at roughly 42 percentage points per second.
+ *
+ * WAITING WOULD NOT FIX IT. The frame was captured at whatever magnification the
+ * ramp had reached at that instant; settling afterwards cannot change what those
+ * pixels already mean. So the callers refuse and ask for a fresh frame — the same
+ * reasoning that already makes them refuse a camera they had to wake, because
+ * waking moves the gimbal and invalidates the frame you measured.
+ *
+ * Detection is two reads a beat apart, because zoomPercent reports travel rather
+ * than the commanded value. Any change at all counts: the reading is an integer
+ * and a settled zoom reads identically every time, so there is no jitter band to
+ * allow for.
+ *
+ * KNOWN GAP, deliberately not papered over: a zoom that has been COMMANDED but has
+ * not started travelling yet reads steady, and this returns ok. On hardware that
+ * dead zone is ~140ms. It is covered for zooms this server issued — those tools
+ * wait for the ramp before returning — but not for one started from the remote,
+ * OBSBOT Center, or AI framing. This narrows the window; it does not prove the
+ * zoom is still.
+ */
+type SteadyStatus =
+  | { ok: true; block: Buffer; status: ReturnType<typeof decodeStatus> }
+  | { ok: false; fromPct: number; toPct: number };
+
+async function readSteadyStatus(
+  t: ObsbotTransport,
+  opts: ZoomSettleOpts = {},
+): Promise<SteadyStatus> {
+  const { motionPollMs } = { ...ZOOM_SETTLE_DEFAULTS, ...opts };
+  const firstPct = decodeStatus(await t.recvStatus()).zoomPercent;
+  await napMs(motionPollMs);
+  // The SECOND read is the one handed back: it is the fresher of the two, and by
+  // the time it is returned it has been confirmed equal to the first anyway.
+  const block = await t.recvStatus();
+  const status = decodeStatus(block);
+  if (status.zoomPercent !== firstPct) {
+    return { ok: false, fromPct: firstPct, toPct: status.zoomPercent };
+  }
+  return { ok: true, block, status };
+}
+
+/** The refusal both aiming tools give when {@link readSteadyStatus} sees travel. */
+const zoomMovingError = (r: { fromPct: number; toPct: number }, verb: string): string =>
+  `the zoom is still moving (zoomPercent read ${r.fromPct} then ${r.toPct}), so the frame you ` +
+  `measured was captured at a magnification the camera has already left — ${verb} from it would ` +
+  `be wrong in proportion. Wait for the zoom to finish, take a fresh snapshot, and try again.`;
+
+/**
+ * Read the focus control for {@link obsbot_status}.
+ *
+ * Focus is a standard UVC control, not a field of the 60-byte vendor status
+ * block, so reporting it costs two extra reads. Worth it: obsbot_focus_auto and
+ * obsbot_focus_manual were write-only, and answering "is it still in autofocus?"
+ * previously meant going underneath the tool surface to the helper's camctrl_get
+ * by hand.
+ *
+ * NEVER THROWS. The status block is what this tool is for, and focus is an
+ * addition to it — trading awake/aiMode/zoomPercent for a failed focus query
+ * would be a bad deal on any device or platform that cannot answer it. A failure
+ * reports mode "unknown" and omits the position, which is also what an
+ * unrecognised flags value gets: the same refuse-to-guess rule the FOV and
+ * AI-mode decodes already follow.
+ *
+ * focusPosition is reported ONLY in manual mode, where it is the setpoint and
+ * round-trips exactly (write 25, read 25). Under autofocus the device does not
+ * expose the motor: MEASURED 2026-07-25, the value stayed pinned at the last
+ * written position across a 40-degree pan, a zoom from 3.34x to 1x, and 9s of
+ * settling — a scene change that must have re-focused the lens. It is the same
+ * setpoint-echo this camera does for pan/tilt. Reporting that number under
+ * autofocus would look like a live focus distance while being a stale write, so
+ * the field is omitted instead and the caller can tell the difference.
+ *
+ * In manual mode the position is normalised onto the same 0-100 scale
+ * obsbot_focus_manual accepts, so the control reads back in the units it was
+ * written in.
+ */
+async function readFocus(
+  t: ObsbotTransport,
+): Promise<{ focusMode: "auto" | "manual" | "unknown"; focusPosition?: number }> {
+  try {
+    const { value, flags } = await t.camCtrlGet(CAMERA_CONTROL_FOCUS);
+    const focusMode =
+      flags === UVC_FLAG_AUTO ? "auto" : flags === UVC_FLAG_MANUAL ? "manual" : "unknown";
+    if (focusMode !== "manual") return { focusMode };
+    const { min, max } = await t.camCtrlRange(CAMERA_CONTROL_FOCUS);
+    return { focusMode, focusPosition: rangeToPercent(value, min, max) };
+  } catch {
+    return { focusMode: "unknown" };
+  }
+}
+
+/**
+ * What a non-device frame declaration commits the caller to.
+ *
+ * obsbot_aim_at_pixel and obsbot_zoom_to_fit compute an angle from the CAMERA's
+ * own field of view and magnification, but they only ever receive pixels — there
+ * is nothing in x/y/frameWidth/frameHeight from which the frame's origin could be
+ * inferred. A frame that OBSBOT Center or OBS has rescaled, cropped or letterboxed
+ * therefore yields a confidently wrong aim, reported as a clean success.
+ *
+ * A blanket refusal would be wrong: a feed configured as a true pass-through aims
+ * correctly. MEASURED 2026-07-25 against an OBS -> NDI chain, a dedicated
+ * (uncomposited) output at 1080p30 matched the camera's own frame to fill 1.0000
+ * and scale 1.03 +/- 0.03, and obsbot_zoom_to_fit framed a target through it
+ * correctly. The SAME chain via OBS's canvas measured 0.900 scale with a 96px
+ * offset -- wrong by 11% plus a fixed bias -- and looked identical in the reply.
+ *
+ * So the caller declares the feed and this states the assumption back, where it
+ * lands in the transcript rather than in a README nobody re-reads mid-task.
+ */
+const frameSourceNote = (source: CaptureSource): string =>
+  `this aim was computed from a '${source}' frame, and is only correct if that feed is an ` +
+  `unmodified pass-through of the camera (no rescale, crop, letterbox or reframing) at the same ` +
+  `field of view — 1080p60 is a 1.214x crop of 1080p30 on this camera, and a compositor's canvas ` +
+  `scaling is invisible in the picture. Verify once by commanding a known gimbal rotation and ` +
+  `checking features move by the predicted number of pixels; a 'device' frame needs no such check.`;
+
+const allEmpty = (slots: PresetSlot[]): boolean => slots.every((s) => !s.occupied);
+
+/**
+ * Read the preset slots with bounded retry, and confirm the one verdict whose error
+ * destroys data.
+ *
+ * Reads can neither damage the camera nor delete anything, so retrying and
+ * re-reading is free in the only currencies that matter. Writes are never retried
+ * here — the caller's write sits outside this function by construction.
+ *
+ * EMPTY is confirmed by a second read because it is the sole verdict that authorizes
+ * an irreversible create-once ADD: a slot wrongly believed empty gets a customer's
+ * preset written over (firmware behaviour there is undecoded). The inverse error is
+ * benign — a slot wrongly believed occupied only makes delete a no-op and update
+ * fail. Disagreement between the two reads means the device is mid-transition, so we
+ * refuse rather than pick a side.
+ */
+async function readPresetSlots(
+  t: ObsbotTransport,
+  gate: () => Promise<ReadyResult>,
+  opts: PresetReadOpts = {},
+): Promise<PresetSlot[]> {
+  const { attempts, backoffMs } = { ...PRESET_READ_DEFAULTS, ...opts };
+  let lastErr: unknown;
+  for (let i = 0; i < attempts; i++) {
+    if (i > 0) {
+      await napMs(backoffMs[Math.min(i - 1, backoffMs.length - 1)]);
+      // Re-probe readiness between attempts: the failure mode we chase is the device
+      // being partway through a transition, and the wake it may send is a decoded,
+      // documented command — not an undecoded write.
+      await gate();
+    }
+    try {
+      const slots = await getPresetSlots(t);
+      if (allEmpty(slots) && !allEmpty(await getPresetSlots(t))) {
+        throw new Error(
+          "preset list unstable: one read reported every slot empty, an immediate " +
+            "re-read disagreed — refusing to treat this as empty",
+        );
+      }
+      return slots;
+    } catch (e) {
+      lastErr = e;
+    }
+  }
+  throw lastErr;
+}
+
+export function createTools(
+  mgr: DeviceManager,
+  capture?: CaptureManager,
+  debug = false,
+  presetRead: PresetReadOpts = {},
+  zoomSettle: ZoomSettleOpts = {},
+): ToolDef[] {
+  // Per-camera resolution derived from the manager. Every camera-addressing tool
+  // takes an optional `camera` selector (the serial); it threads through here so
+  // the transport, reconnect controller and readiness gate all target that one
+  // camera. `camera` omitted + a single camera attached => that camera (identical
+  // to the pre-selector behaviour). `camera` omitted + several attached => mgr.get
+  // throws AmbiguousCameraError, and an unknown serial throws UnknownCameraError;
+  // both surface to the caller via the gate's "unreachable" path (its getTransport
+  // throwing is already treated as unreachable, and the message is carried through).
+  const getTransport = (camera?: string): Promise<ObsbotTransport> => mgr.get(camera);
+  const reconnectFor = (camera?: string): ReconnectCtl => ({
+    invalidate: () => mgr.invalidate(camera),
+    takeReconnected: () => mgr.takeReconnected(camera),
+  });
+  // Readiness gate for gimbal/AI commands: probe presence + auto-wake if asleep,
+  // self-heal (invalidate + re-open) on a mid-session disconnect. Returns the
+  // ready transport or an { ok:false } error the handler passes straight through.
+  const gate = (camera?: string) => ensureReady(() => getTransport(camera), reconnectFor(camera));
+  const needCapture = (): CaptureManager => {
+    if (!capture) throw new Error("capture manager not configured");
+    return capture;
+  };
+  const captureErrorText = (e: unknown): { content: Array<{ type: "text"; text: string }> } | never => {
+    if (e instanceof CaptureError) return { content: [{ type: "text", text: e.message }] };
+    throw e;
+  };
+
+  const toolDefs: ToolDef[] = [
+    {
+      name: "obsbot_devices",
+      description:
+        "List attached OBSBOT-compatible cameras. Each entry is { serial?, locationId?, name, " +
+        "status, reason? }: serial is the value to pass as `camera` to any camera-addressing tool " +
+        "(present where obtainable — reading it requires briefly opening the camera); status " +
+        "is available (free to bind), bound (already opened by this process), or busy (could not " +
+        "be opened and identified, so it can't be targeted here — usually another process holds " +
+        "it, but it also covers a camera that opened yet would not answer). On a busy entry, " +
+        "`reason` carries the underlying error and distinguishes those cases.",
+      schema: listDevicesSchema,
+      handler: async (args: unknown) => {
+        listDevicesSchema.parse(args);
+        return { cameras: await mgr.listCameras() };
+      },
+    },
+    {
+      name: "obsbot_wake",
+      description:
+        "Wake the camera/gimbal (sends \"run\"). This MOVES the camera: waking un-stows the " +
+        "gimbal and brings it back to level (pitch ~0). Most control commands also wake the " +
+        "camera implicitly as a side effect.",
+      schema: wakeSchema,
+      handler: async (args: unknown) => {
+        const { camera } = wakeSchema.parse(args);
+        const t = await getTransport(camera);
+        await t.sendVendor(encodeSetRunStatus("run").buildFrame(t.nextSeq()));
+        return { ok: true, state: "run" };
+      },
+    },
+    {
+      name: "obsbot_sleep",
+      description:
+        "Sleep the camera/gimbal (sends \"sleep\"). This MOVES the camera: sleeping STOWS the " +
+        "gimbal, tilting it face-down to roughly pitch 84°, so obsbot_gimbal_position will read " +
+        "~84 rather than the pose you left it in. obsbot_wake un-stows it.",
+      schema: sleepSchema,
+      handler: async (args: unknown) => {
+        const { camera } = sleepSchema.parse(args);
+        const t = await getTransport(camera);
+        await t.sendVendor(encodeSetRunStatus("sleep").buildFrame(t.nextSeq()));
+        return { ok: true, state: "sleep" };
+      },
+    },
+    {
+      name: "obsbot_gimbal_move",
+      description:
+        "Move the gimbal to an absolute yaw/pitch angle (degrees); positive yaw pans to the " +
+        `camera's left, positive pitch tilts down. Yaw is clamped to ` +
+        `[-${GIMBAL_YAW_LIMIT_DEG},${GIMBAL_YAW_LIMIT_DEG}], pitch to ` +
+        `[-${GIMBAL_PITCH_LIMIT_DEG},${GIMBAL_PITCH_LIMIT_DEG}]. ` +
+        "Absolute positioning (1:1 degrees), verified on hardware.",
+      schema: ptzMoveAngleSchema,
+      handler: async (args: unknown) => {
+        const parsed = ptzMoveAngleSchema.parse(args);
+        const yaw = clamp(parsed.yaw, -GIMBAL_YAW_LIMIT_DEG, GIMBAL_YAW_LIMIT_DEG);
+        const pitch = clamp(parsed.pitch, -GIMBAL_PITCH_LIMIT_DEG, GIMBAL_PITCH_LIMIT_DEG);
+        const roll = parsed.roll;
+        const ready = await gate(parsed.camera);
+        if (!ready.ok) return ready;
+        const t = ready.transport;
+        await t.gimbalSet(yaw, pitch, roll);
+        return ready.reconnected ? { yaw, pitch, roll, reconnected: true } : { yaw, pitch, roll };
+      },
+    },
+    {
+      name: "obsbot_gimbal_move_speed",
+      description:
+        "Drive the gimbal at a yaw/pitch speed in DEGREES PER SECOND (positive yaw pans to the " +
+        "camera's left, matching obsbot_gimbal_move), then automatically stop after autoStopMs " +
+        "(default 800ms) so it can't run away. Speed is clamped to ±150 °/s; the returned " +
+        "yaw/pitch are the speeds actually used.",
+      schema: ptzMoveSpeedSchema,
+      handler: async (args: unknown) => {
+        const parsed = ptzMoveSpeedSchema.parse(args);
+        // Degrees per second, measured on hardware 2026-07-21 against the live
+        // position readback: 10/1000ms -> 10°, 60/500ms -> 29°, 120/300ms -> 35°,
+        // 170/300ms -> 49° — linear across the band.
+        //
+        // Clamping matters more here than for absolute moves. Past the limit the
+        // firmware does not saturate, it silently IGNORES the command: 180, 200
+        // and 300 each produced EXACTLY 0° of motion while still reporting
+        // success. Unclamped, a caller gets ok:true and a camera that never
+        // moved. 150 sits inside the verified-good band (150/160/170 all moved)
+        // with margin, and matches obsbot_gimbal_move's yaw bound so the API has
+        // one number to remember.
+        const yaw = clamp(parsed.yaw, -GIMBAL_MAX_SPEED_DPS, GIMBAL_MAX_SPEED_DPS);
+        const pitch = clamp(parsed.pitch, -GIMBAL_MAX_SPEED_DPS, GIMBAL_MAX_SPEED_DPS);
+        const roll = clamp(parsed.roll, -GIMBAL_MAX_SPEED_DPS, GIMBAL_MAX_SPEED_DPS);
+        const ready = await gate(parsed.camera);
+        if (!ready.ok) return ready;
+        const t = ready.transport;
+        // Firmware velocity-yaw is inverted relative to position-yaw: the vendor
+        // AI_SET_GIM_SPEED +yaw drives right (opposite of obsbot_gimbal_move).
+        // The transport's gimbalSpeed handles this per-platform as needed.
+        await t.gimbalSpeed(yaw, pitch, roll, parsed.autoStopMs);
+        return {
+          ok: true,
+          yaw,
+          pitch,
+          stopped: parsed.autoStopMs > 0,
+          ...(ready.reconnected && { reconnected: true }),
+        };
+      },
+    },
+    {
+      name: "obsbot_gimbal_recenter",
+      description:
+        "Recenter the gimbal — drives it back to yaw 0 / pitch 0 (level and facing forward). " +
+        "Returns as soon as the command is sent: the gimbal may still be moving, so poll " +
+        "obsbot_gimbal_position if you need to know it has arrived.",
+      schema: gimbalRecenterSchema,
+      handler: async (args: unknown) => {
+        const { camera } = gimbalRecenterSchema.parse(args);
+        const ready = await gate(camera);
+        if (!ready.ok) return ready;
+        const t = ready.transport;
+        await t.gimbalRecenter();
+        return { ok: true, ...(ready.reconnected && { reconnected: true }) };
+      },
+    },
+    {
+      name: "obsbot_zoom_uvc",
+      description:
+        "Standard UVC zoom: set an absolute zoom ratio, clamped to [1.0, 2.0]. Snaps to the " +
+        "requested target exactly (unlike obsbot_zoom_vendor, whose ratio scale differs and " +
+        "may not land exactly where asked). Waits for the zoom to actually arrive and returns " +
+        "{ settled }: the ramp is not instant (a full 1.0->2.0 sweep takes about 2.4s), and " +
+        "obsbot_aim_at_pixel and obsbot_zoom_to_fit both refuse while it is in flight, so this " +
+        "returning early would just move the failure downstream. settled:false means the zoom " +
+        "had not arrived within the timeout — the command was still sent.",
+      schema: zoomAbsoluteSchema,
+      handler: async (args: unknown) => {
+        const parsed = zoomAbsoluteSchema.parse(args);
+        const ratio = clamp(parsed.ratio, 1.0, 2.0);
+        const t = await getTransport(parsed.camera);
+        const { min, max } = await t.zoomRange();
+        await t.zoomSet(zoomRatioToUnits(ratio, min, max));
+        // Deliberately NOT done for obsbot_zoom_vendor. waitForZoomSettle needs the
+        // target on the zoomPercent scale, and that tool's ratio scale is a different
+        // one that "may not land exactly where asked" — so it would report
+        // settled:false on a perfectly good zoom. The alternative signal, "zoomPercent
+        // stopped changing", reads as stopped during the ~140ms before the ramp starts
+        // moving, which would be a worse lie than saying nothing.
+        const settled = await waitForZoomSettle(t, ratio, zoomSettle);
+        return { ok: true, ratio, settled };
+      },
+    },
+    {
+      name: "obsbot_ai_track",
+      description:
+        "Enable or disable AI tracking and choose the mode. When enabled the camera " +
+        "follows the subject; disabling stops tracking. `mode` is either a human framing " +
+        "(normal | upper-body | close-up | headless | lower-body) or a standalone scene " +
+        "mode (group | whiteboard | desk | hand); scene modes imply enabled:true. After " +
+        "writing, the tool polls the status block until the mode settles and returns " +
+        "{ verified, matched } — the aiMode the device actually landed on (matched:false " +
+        "means no subject was being tracked, so the mode could not take effect yet).",
+      schema: aiTrackingSchema,
+      handler: async (args: unknown) => {
+        const { enabled, mode, camera } = aiTrackingSchema.parse(args);
+        const ready = await gate(camera);
+        if (!ready.ok) return ready;
+        const t = ready.transport;
+        const readAiMode = async (): Promise<AiModeStatus> => {
+          try {
+            return decodeStatus(await t.recvStatus()).aiMode;
+          } catch {
+            return "unknown"; // transient read mid-switch — keep polling
+          }
+        };
+        // Snapshot the framing before the write so verify can tell a real change
+        // from the pre-write value (and skip the m=6 transient). See verifyFraming.
+        const before = await readAiMode();
+        // OBSBOT Center toggles tracking/mode with a raw uvcExt write to selector 6,
+        // NOT a framed V3 command (which the Tiny 2 ACKs but ignores). byte[2] is the
+        // work mode, byte[3] the human framing sub-mode. A scene mode (group/whiteboard/
+        // desk/hand) is its own work mode; a framing is the human work mode. See
+        // encodeAiMode / encodeAiTracking.
+        const payload =
+          !enabled ? encodeAiMode("none")
+          : isSceneMode(mode) ? encodeAiMode(mode)
+          : encodeAiTracking(true, mode as AiFramingMode);
+        await t.xuRaw(UVC_XU_SELECTOR, payload);
+        // Verify by readback: aiMode settles to the requested mode after a brief m=6
+        // transient. The mode name doubles as its aiMode readback value.
+        const want: AiModeStatus = enabled ? (mode as AiModeStatus) : "no-tracking";
+        const { verified, matched } = await verifyFraming(readAiMode, want, before);
+        return { ok: true, enabled, mode, verified, matched, ...(ready.reconnected && { reconnected: true }) };
+      },
+    },
+    {
+      name: "obsbot_ai_track_speed",
+      description:
+        "Set the AI tracking-speed preset (OBSBOT Center's Standard/Sport). " +
+        "speed: standard (slower follow) | sport (snappier follow).",
+      schema: aiTrackSpeedSchema,
+      handler: async (args: unknown) => {
+        const { speed, camera } = aiTrackSpeedSchema.parse(args);
+        const t = await getTransport(camera);
+        await t.sendVendor(encodeAiTrackSpeed(speed).buildFrame(t.nextSeq()));
+        return { ok: true, speed };
+      },
+    },
+    {
+      name: "obsbot_zoom_vendor",
+      description:
+        "Vendor zoom path with adjustable speed: zoom to a ratio at a chosen speed. This tool's " +
+        "ratio scale differs from obsbot_zoom_uvc's and may not land exactly on the requested " +
+        "target. ratio is clamped to [1.0,2.0]; speed 0=device default, 1-10 slow→fast, 255=maximum.",
+      schema: zoomSpeedSchema,
+      handler: async (args: unknown) => {
+        const parsed = zoomSpeedSchema.parse(args);
+        const ratio = clamp(parsed.ratio, 1.0, 2.0);
+        const speed = clamp(Math.round(parsed.speed), 0, 255);
+        const t = await getTransport(parsed.camera);
+        await t.sendVendor(
+          encodeZoomWithSpeed(Math.round(ratio * 100), speed).buildFrame(t.nextSeq()),
+        );
+        return { ok: true, ratio, speed };
+      },
+    },
+    {
+      name: "obsbot_voice_control",
+      description: "Enable or disable one Tiny 2 built-in voice command. Transport write only; behavior is not verified.",
+      schema: voiceControlSchema,
+      handler: async (args: unknown) => {
+        const { camera, command, enabled } = voiceControlSchema.parse(args);
+        const ready = await gate(camera);
+        if (!ready.ok) return ready;
+        const commands = ["wake", "sleep", "track", "unlock", "zoom-in", "zoom-out", "presets"];
+        const payload = Buffer.alloc(60);
+        payload.set([0x15, 2, commands.indexOf(command), Number(enabled)]);
+        await ready.transport.xuRaw(UVC_XU_SELECTOR, payload);
+        return { ok: true, command, enabled, verified: false };
+      },
+    },
+    {
+      name: "obsbot_voice_language",
+      description: "Select English or Chinese for Tiny 2 built-in voice recognition. Does not change the app language. Transport write only.",
+      schema: voiceLanguageSchema,
+      handler: async (args: unknown) => {
+        const { camera, language } = voiceLanguageSchema.parse(args);
+        const ready = await gate(camera);
+        if (!ready.ok) return ready;
+        const payload = Buffer.alloc(60);
+        payload.set([0x15, 2, 101, language === "english" ? 1 : 0]);
+        await ready.transport.xuRaw(UVC_XU_SELECTOR, payload);
+        return { ok: true, language, verified: false };
+      },
+    },
+    {
+      name: "obsbot_gesture_control",
+      description: "Enable or disable Tiny 2 target, zoom, dynamic zoom or direction-mirror gestures. Transport write only; firmware behavior must be checked on camera.",
+      schema: gestureControlSchema,
+      handler: async (args: unknown) => {
+        const { camera, gesture, enabled } = gestureControlSchema.parse(args);
+        const ready = await gate(camera);
+        if (!ready.ok) return ready;
+        const opcodes = { target: "AI_SET_GESTURE_TARGET", zoom: "AI_SET_GESTURE_ZOOM",
+          "dynamic-zoom": "AI_SET_GESTURE_DYNAMIC_ZOOM", mirror: "AI_SET_GESTURE_DIR_MIRROR" };
+        const t = ready.transport;
+        await t.sendVendor(encodeVendorProbe(opcodes[gesture], Buffer.from([Number(enabled)])).buildFrame(t.nextSeq()));
+        return { ok: true, gesture, enabled, verified: false };
+      },
+    },
+    {
+      name: "obsbot_focus_face",
+      description: "Enable or disable face-priority autofocus.",
+      schema: faceFocusSchema,
+      handler: async (args: unknown) => {
+        const { enabled, camera } = faceFocusSchema.parse(args);
+        const t = await getTransport(camera);
+        await t.sendVendor(encodeFaceFocus(enabled).buildFrame(t.nextSeq()));
+        return { ok: true, enabled };
+      },
+    },
+    {
+      name: "obsbot_status",
+      description:
+        "Read the camera's live status block. Returns { awake, hdr, faceAe, aiMode, trackSpeed, " +
+        "fovMode, zoomPercent, focusMode, focusPosition }: " +
+        "faceAe is whether auto-exposure is metering for a detected face; " +
+        "aiMode is the current AI framing (no-tracking|normal|upper-body|close-up|headless|" +
+        "lower-body|desk|whiteboard|hand|group|unknown); trackSpeed is standard|sport|unknown; " +
+        "fovMode is the field-of-view mode (wide|medium|narrow|custom|unknown), where custom means " +
+        "a continuous zoom overrode the discrete modes; zoomPercent is the zoom position, 0-100; " +
+        "focusMode is auto|manual|unknown. focusPosition is present ONLY in manual mode, on the " +
+        "same 0-100 scale obsbot_focus_manual takes: under autofocus this camera does not expose " +
+        "the motor, it echoes the last written value, so reporting it would look like a live " +
+        "focus distance while being stale. Focus is a standard UVC control rather than a field " +
+        "of the status block, so it costs an extra read; a device that cannot answer it reports " +
+        "focusMode unknown rather than failing the whole read. " +
+        "Under --debug the result also carries `raw`: the full 60-byte status block as hex " +
+        "(for reverse-engineering undecoded offsets).",
+      schema: getStatusSchema,
+      handler: async (args: unknown) => {
+        const { camera } = getStatusSchema.parse(args);
+        const t = await getTransport(camera);
+        try {
+          const block = await t.recvStatus();
+          return {
+            ok: true,
+            ...decodeStatus(block),
+            ...(await readFocus(t)),
+            ...(debug ? { raw: block.toString("hex") } : {}),
+          };
+        } catch (e) {
+          return { ok: false, error: `could not read camera status: ${(e as Error).message}` };
+        }
+      },
+    },
+    {
+      name: "obsbot_debug_probe",
+      description:
+        "RE/diagnostics only — generic XU byte access for reverse-engineering the feedback surface. " +
+        "mode 'get': GET_CUR read `length` bytes from XU `selector` (default selector 6; use a large " +
+        "length to probe the status block's true size, or sweep other selectors). " +
+        "mode 'set': SET_CUR write raw `hex` bytes to XU `selector` (e.g. replay a captured frame). " +
+        "mode 'query': frame table `opcode` (default AI_GET_QUICK_STATUS) — a pure GET (no " +
+        "payloadHex) is framed header-only (flags 0x01, the only flavour this device answers for " +
+        "a GET); supplying `payloadHex` frames a SET/command instead (flags 0x25) — send on the " +
+        "vendor selector, then poll for the matching reply frame. Returns raw hex. Not for normal use.",
+      schema: probeSchema,
+      handler: async (args: unknown) => {
+        const { mode, selector, length, hex, opcode, payloadHex } = probeSchema.parse(args);
+        const t = await getTransport();
+        try {
+          if (mode === "get") {
+            const sel = selector ?? 0x06;
+            const block = await t.xuGetRaw(sel, length ?? 128);
+            return { ok: true, selector: sel, len: block.length, raw: block.toString("hex") };
+          }
+          if (mode === "set") {
+            if (selector === undefined || !hex) {
+              return { ok: false, error: "mode 'set' requires selector and hex" };
+            }
+            await t.xuRaw(selector, Buffer.from(hex, "hex"));
+            return { ok: true, selector, sent: hex };
+          }
+          // mode "query": build a framed V3 command and poll the vendor reply mailbox
+          // until a valid, matching reply appears.
+          const payload = payloadHex ? Buffer.from(payloadHex, "hex") : Buffer.alloc(0);
+          const name = opcode ?? "AI_GET_QUICK_STATUS";
+          const op = OP_BY_NAME.get(name);
+          if (!op || op.wireCmd === null || op.receiver === null) {
+            return { ok: false, error: `opcode "${name}" is not a sendable V3 command` };
+          }
+          // A pure GET (no nested payload) only gets an answer on this device when
+          // framed header-only (flags 0x01, encodeVendorGet) — encodeVendorProbe's
+          // SET flavour (flags 0x25) returns a stale echo instead of a real answer
+          // when there's no payload for the device to act on. A supplied payloadHex
+          // means an actual SET/command, so that keeps the 0x25 framing.
+          const seq = t.nextSeq();
+          const frame = (
+            payload.length === 0 ? encodeVendorGet(name) : encodeVendorProbe(name, payload)
+          ).buildFrame(seq);
+          await t.xuRaw(PROBE_VENDOR_SELECTOR, frame);
+
+          // The reply mailbox retains the PREVIOUS reply until the new one lands, so
+          // a single unvalidated read can return stale data. Trust a reply only once
+          // it parses cleanly AND both its cmd and seq match what was just sent (same
+          // validation readSerialVia does in transport/read-serial.ts).
+          const replyLen = length ?? 60;
+          for (let i = 0; i < PROBE_QUERY_POLL_ATTEMPTS; i++) {
+            await napMs(PROBE_QUERY_POLL_DELAY_MS); // let the reply land before reading
+            const raw = await t.xuGetRaw(PROBE_VENDOR_SELECTOR, replyLen);
+            try {
+              const p = parseFrame(raw);
+              if (p.cmd === op.wireCmd && p.seq === seq) {
+                return {
+                  ok: true,
+                  opcode: name,
+                  sentFrame: frame.toString("hex"),
+                  replyHex: raw.toString("hex"),
+                  parsed: {
+                    cmd: "0x" + p.cmd.toString(16).padStart(4, "0"),
+                    receiver: p.receiver,
+                    payloadHex: p.payload.toString("hex"),
+                  },
+                };
+              }
+            } catch {
+              // Not our reply yet (stale mailbox, still in flight, or garbage) — keep polling.
+            }
+          }
+          return {
+            ok: false,
+            error: `no valid reply for ${name} (seq ${seq}) after ${PROBE_QUERY_POLL_ATTEMPTS} attempts`,
+            sentFrame: frame.toString("hex"),
+          };
+        } catch (e) {
+          return { ok: false, error: (e as Error).message };
+        }
+      },
+    },
+    {
+      name: "obsbot_image_fov",
+      description: "Set the field of view. fov: wide (86°) | medium (78°) | narrow (65°).",
+      schema: fovSchema,
+      handler: async (args: unknown) => {
+        const { fov, camera } = fovSchema.parse(args);
+        const t = await getTransport(camera);
+        await t.xuRaw(UVC_XU_SELECTOR, encodeFov(fov as FovType));
+        return { ok: true, fov };
+      },
+    },
+    {
+      name: "obsbot_image_hdr",
+      description: "Toggle HDR/WDR imaging on or off.",
+      schema: hdrSchema,
+      handler: async (args: unknown) => {
+        const { enabled, camera } = hdrSchema.parse(args);
+        const t = await getTransport(camera);
+        await t.xuRaw(UVC_XU_SELECTOR, encodeHdr(enabled));
+        return { ok: true, enabled };
+      },
+    },
+    {
+      name: "obsbot_focus_auto",
+      description: "Enable continuous autofocus.",
+      schema: focusAutoSchema,
+      handler: async (args: unknown) => {
+        const { camera } = focusAutoSchema.parse(args);
+        const t = await getTransport(camera);
+        await t.camCtrlSet(CAMERA_CONTROL_FOCUS, 0, UVC_FLAG_AUTO);
+        return { ok: true, mode: "auto" };
+      },
+    },
+    {
+      name: "obsbot_focus_manual",
+      description:
+        "Set the focus motor to position (0-100, near→far), mapped onto the device range.",
+      schema: focusManualSchema,
+      handler: async (args: unknown) => {
+        const { position, camera } = focusManualSchema.parse(args);
+        const t = await getTransport(camera);
+        const { min, max } = await t.camCtrlRange(CAMERA_CONTROL_FOCUS);
+        const value = percentToRange(position, min, max);
+        await t.camCtrlSet(CAMERA_CONTROL_FOCUS, value, UVC_FLAG_MANUAL);
+        return { ok: true, mode: "manual", position, value };
+      },
+    },
+    {
+      name: "obsbot_gimbal_position",
+      description:
+        "Read the gimbal's current absolute yaw/pitch in degrees (positive yaw = camera's " +
+        "left, positive pitch = down) via the standard UVC Pan/Tilt controls. This is a live " +
+        "hardware readout accurate to ±1°, reported rounded to 2 decimal places (finer digits " +
+        "would be noise, not precision): it is valid during a move as well as after one, " +
+        "and reflects motion the host did not command (speed moves, recenter, tracking).",
+      schema: gimbalPositionSchema,
+      handler: async (args: unknown) => {
+        const { camera } = gimbalPositionSchema.parse(args);
+        const t = await getTransport(camera);
+        const pan = await t.camCtrlGet(CAMERA_CONTROL_PAN);
+        const tilt = await t.camCtrlGet(CAMERA_CONTROL_TILT);
+        // UVC pan value is degrees, same sign as our yaw (+ = camera-left). UVC tilt
+        // is degrees but positive = up, so negate to match our +pitch = down convention.
+        return { yaw: round2(pan.value), pitch: round2(-tilt.value) };
+      },
+    },
+    {
+      name: "obsbot_aim_at_pixel",
+      description:
+        "Point the camera at a specific pixel in a frame you just captured. Give the pixel's x/y " +
+        "and the frameWidth/frameHeight from THE SAME obsbot_capture_snapshot result — mixing a " +
+        "pixel from one frame with dimensions from another aims at the wrong place and cannot be " +
+        "detected. `source` DECLARES which feed the frame came from (default device); it cannot be " +
+        "inferred from the pixels. A virtual or ndi frame is accepted, but only aims correctly if " +
+        "that feed is an unmodified pass-through of the camera — a compositor's rescale or " +
+        "letterbox is invisible in the picture and silently wrong here — so a non-device " +
+        "declaration comes back with that assumption stated. Takes no " +
+        "field-of-view or zoom argument: it reads the camera's magnification from its reported " +
+        "state, a discrete FOV mode or a continuous zoom alike, so it works at any zoom. Refuses " +
+        "when AI tracking is active (tracking moves the gimbal itself and would fight the aim), " +
+        "when the FOV mode can't be decoded, or when a corrupt zoom reading would resolve to an " +
+        "implausible magnification, so it never aims on an assumption it cannot check. If the " +
+        "camera was asleep, waking it moves the gimbal and invalidates the " +
+        "frame you measured, so the call refuses instead of aiming on stale geometry — take a fresh " +
+        "snapshot and retry. Returns clamped:true if the target was outside the gimbal's range; the " +
+        "camera still moves, to the nearest reachable pose. Refuses (ok:false) instead of moving when " +
+        "the pixel lies past vertical from the current pose — reachable only by an \"over the top\" " +
+        "rotation that would swing the camera toward the opposite side of the room, not toward the " +
+        "target; tilt toward the pixel first, then re-aim.",
+      schema: aimAtPixelSchema,
+      handler: async (args: unknown) => {
+        const { x, y, frameWidth, frameHeight, camera, source } = aimAtPixelSchema.parse(args);
+
+        const aspectRefusal = refuseIfNot169(frameWidth, frameHeight);
+        if (aspectRefusal) return aspectRefusal;
+        if (x < 0 || x > frameWidth || y < 0 || y > frameHeight) {
+          return { ok: false, error: `pixel (${x},${y}) is outside the ${frameWidth}x${frameHeight} frame` };
+        }
+
+        // The gate wakes a sleeping camera and waits for it to settle. If it had
+        // to wake the camera, the gimbal just moved out from under the frame the
+        // caller measured — refuse below rather than read a pose that no longer
+        // corresponds to that frame.
+        const ready = await gate(camera);
+        if (!ready.ok) return ready;
+        const t = ready.transport;
+        if (ready.woke) {
+          return {
+            ok: false,
+            error:
+              "the camera was asleep and waking it moved the gimbal, so the frame you measured no " +
+              "longer matches where the camera is pointing. Take a fresh snapshot and aim again.",
+          };
+        }
+
+        const steady = await readSteadyStatus(t, zoomSettle);
+        if (!steady.ok) return { ok: false, error: zoomMovingError(steady, "aiming") };
+        const { block, status } = steady;
+        if (status.aiMode === "unknown") {
+          return {
+            ok: false,
+            error:
+              "could not read the camera's AI-tracking mode (the status block didn't decode this " +
+              "read — this can happen during a brief mode-switch transient); retry the aim.",
+          };
+        }
+        if (status.aiMode !== "no-tracking") {
+          return {
+            ok: false,
+            error:
+              `AI tracking is active (${status.aiMode}); it moves the gimbal itself and would ` +
+              `fight the aim. Disable it with obsbot_ai_track {enabled:false} first.`,
+          };
+        }
+        // One function decides whether the camera's reported state resolves to a
+        // usable magnification — discrete mode or continuous zoom alike — so there
+        // is exactly one place that decides to refuse rather than guess, AND
+        // exactly one place that decides WHY (see MagnificationResult).
+        const resolved = resolveMagnification(status);
+        if (!resolved.ok) {
+          if (resolved.reason === "unknown-fov") {
+            // block[0x11] is STATUS_OFF_FOV_MODE (src/codec/commands.ts) — same offset
+            // decodeStatus reads to produce fovMode, surfaced raw since "unknown" means
+            // it didn't match any known value.
+            return {
+              ok: false,
+              error:
+                `could not read the camera's FOV mode (raw byte 0x${block[0x11].toString(16).padStart(2, "0")}); ` +
+                `refusing to guess it. Set a known mode with obsbot_image_fov (e.g. {fov:"wide"}) and retry.`,
+            };
+          }
+          // reason "implausible-zoom": fovMode is "custom" but the zoom it derives
+          // from is implausible — e.g. zoomPercent far outside 0-100 — so the
+          // resulting magnification falls outside the camera's known range. That is
+          // a corrupt reading, not a real optical state; refuse rather than aim
+          // from a bad number.
+          return {
+            ok: false,
+            error:
+              `the camera's zoom reading (zoomPercent ${resolved.zoomPercent}) resolves to a ` +
+              `magnification outside the camera's known range [${MIN_MAGNIFICATION}, ` +
+              `${MAX_MAGNIFICATION}]; refusing rather than aim from what looks like a corrupt ` +
+              `status read. Retry, or set a known mode with obsbot_image_fov.`,
+          };
+        }
+        const magnification = resolved.magnification;
+
+        // Settled pose, not a bare read: this becomes a composed absolute target
+        // below, so a mid-slew reading would aim short by whatever travel was
+        // left. See readSteadyPose.
+        const { yaw, pitch } = await readSteadyPose(t);
+
+        // resolveMagnification already folded fovMode and zoomPercent into one
+        // number — a discrete mode's inherent crop and a continuous zoom are two
+        // ways of writing to the SAME scale, so there is nothing left to combine.
+        const aim = aimAtPixel(
+          x, y,
+          { width: frameWidth, height: frameHeight },
+          { magnification },
+          { yaw, pitch },
+        );
+
+        // Over the top is not an ordinary clamp: the target ray points behind
+        // the camera's current heading, so the nearest reachable yaw is on the
+        // FAR side of the gimbal's range, not near the target. Moving there
+        // would slew ~150 degrees into the opposite corner of the room while
+        // reporting clamped:true, which reads as "landed short" rather than
+        // "went the wrong way" — refuse instead of moving.
+        if (aim.overTheTop) {
+          return {
+            ok: false,
+            error:
+              `pixel (${x},${y}) lies past vertical from the current pose (yaw ${yaw.toFixed(1)}, ` +
+              `pitch ${pitch.toFixed(1)}); it is not reachable while keeping the image upright, only ` +
+              `by an "over the top" rotation that would swing the camera the opposite way. Tilt toward ` +
+              `the pixel first (e.g. obsbot_gimbal_move), then re-aim from the new pose.`,
+          };
+        }
+
+        await t.gimbalSet(aim.target.yaw, aim.target.pitch, 0);
+        return {
+          ok: true,
+          target: aim.target,
+          offset: aim.offset,
+          clamped: aim.clamped,
+          fovMode: status.fovMode,
+          current: { yaw, pitch },
+          source,
+          ...(source === "device" ? {} : { note: frameSourceNote(source) }),
+          ...(ready.reconnected ? { reconnected: true } : {}),
+        };
+      },
+    },
+    {
+      name: "obsbot_zoom_to_fit",
+      description:
+        "Frame a region of a frame you just captured: centre the gimbal on it and zoom so the " +
+        "region fills the frame. Give x/y/width/height of the region plus the frameWidth/frameHeight " +
+        "from THE SAME obsbot_capture_snapshot result — mixing a region from one frame with " +
+        "dimensions from another frames the wrong place and cannot be detected. Must come from a " +
+        "snapshot, and takes the same `source` declaration as obsbot_aim_at_pixel. `margin` (default 0.1) " +
+        "backs the zoom off by that fraction so the region isn't framed edge-to-edge; the tighter of " +
+        "the region's two axes decides the zoom, so the WHOLE region stays visible rather than being " +
+        "cropped on one side. Moves the gimbal BEFORE zooming, since zooming first can push the " +
+        "region's centre out of frame. Refuses on the same conditions as obsbot_aim_at_pixel: AI " +
+        "tracking active, the camera was asleep (waking it moves the gimbal and invalidates the " +
+        "frame), the FOV mode can't be decoded, a corrupt zoom reading, or the region's centre lying " +
+        "past vertical from the current pose, or a frame that isn't 16:9 (obsbot_capture_snapshot " +
+        "always returns 16:9; a non-16:9 pair looks transposed). Also refuses a region that isn't " +
+        "within the frame (edges included), or has non-positive width/height. The requested zoom is " +
+        "clamped to the camera's [1x, 4x] magnification range and reported via `clamped`; a partial " +
+        "fit still moves and zooms to the limit. Zoom ramps rather than jumping, so the tool polls " +
+        "the status block for up to 3s waiting for it to arrive and returns `settled:false` (not an " +
+        "error) if it didn't — " +
+        "a frame captured mid-ramp is at an unknown magnification, so check `settled` before trusting " +
+        "a follow-up snapshot.",
+      schema: zoomToFitSchema,
+      handler: async (args: unknown) => {
+        const { x, y, width, height, frameWidth, frameHeight, margin, camera, source } =
+          zoomToFitSchema.parse(args);
+
+        // Pure input validation first, no I/O — same placement as obsbot_aim_at_pixel's
+        // own frame/pixel checks, and the same order: the aspect check runs before
+        // the region-bounds check, matching obsbot_aim_at_pixel.
+        const aspectRefusal = refuseIfNot169(frameWidth, frameHeight);
+        if (aspectRefusal) return aspectRefusal;
+        // The region must lie within the frame, edges included: a region touching
+        // the frame's own edges is valid (a region that already IS the full frame
+        // must pass — the full-frame fit test depends on it), only crossing them
+        // is refused.
+        if (
+          width <= 0 || height <= 0 ||
+          x < 0 || y < 0 ||
+          x + width > frameWidth || y + height > frameHeight
+        ) {
+          return {
+            ok: false,
+            error:
+              `region (${x},${y}) ${width}x${height} is not inside the ${frameWidth}x${frameHeight} ` +
+              `frame, or has non-positive width/height.`,
+          };
+        }
+
+        // The gate wakes a sleeping camera and waits for it to settle. If it had to
+        // wake the camera, the gimbal just moved out from under the frame the caller
+        // measured — refuse below rather than frame a region that no longer means
+        // what it did (same reasoning as obsbot_aim_at_pixel).
+        const ready = await gate(camera);
+        if (!ready.ok) return ready;
+        const t = ready.transport;
+        if (ready.woke) {
+          return {
+            ok: false,
+            error:
+              "the camera was asleep and waking it moved the gimbal, so the frame you measured no " +
+              "longer matches where the camera is pointing. Take a fresh snapshot and try again.",
+          };
+        }
+
+        const steady = await readSteadyStatus(t, zoomSettle);
+        if (!steady.ok) return { ok: false, error: zoomMovingError(steady, "framing") };
+        const { block, status } = steady;
+        if (status.aiMode === "unknown") {
+          return {
+            ok: false,
+            error:
+              "could not read the camera's AI-tracking mode (the status block didn't decode this " +
+              "read — this can happen during a brief mode-switch transient); retry.",
+          };
+        }
+        if (status.aiMode !== "no-tracking") {
+          return {
+            ok: false,
+            error:
+              `AI tracking is active (${status.aiMode}); it moves the gimbal itself and would ` +
+              `fight the framing. Disable it with obsbot_ai_track {enabled:false} first.`,
+          };
+        }
+        const resolved = resolveMagnification(status);
+        if (!resolved.ok) {
+          if (resolved.reason === "unknown-fov") {
+            return {
+              ok: false,
+              error:
+                `could not read the camera's FOV mode (raw byte 0x${block[0x11].toString(16).padStart(2, "0")}); ` +
+                `refusing to guess it. Set a known mode with obsbot_image_fov (e.g. {fov:"wide"}) and retry.`,
+            };
+          }
+          return {
+            ok: false,
+            error:
+              `the camera's zoom reading (zoomPercent ${resolved.zoomPercent}) resolves to a ` +
+              `magnification outside the camera's known range [${MIN_MAGNIFICATION}, ` +
+              `${MAX_MAGNIFICATION}]; refusing rather than frame from what looks like a corrupt ` +
+              `status read. Retry, or set a known mode with obsbot_image_fov.`,
+          };
+        }
+        const magnification = resolved.magnification;
+
+        // Same read path as obsbot_aim_at_pixel, and settled for the same reason:
+        // this pose is composed into an absolute target, not reported.
+        const { yaw, pitch } = await readSteadyPose(t);
+
+        // Aim uses the CURRENT magnification: it has to match the optics the
+        // caller's frame was actually captured at, not the new fitted zoom.
+        const centerX = x + width / 2;
+        const centerY = y + height / 2;
+        const aim = aimAtPixel(
+          centerX, centerY,
+          { width: frameWidth, height: frameHeight },
+          { magnification },
+          { yaw, pitch },
+        );
+
+        if (aim.overTheTop) {
+          return {
+            ok: false,
+            error:
+              `region centre (${centerX},${centerY}) lies past vertical from the current pose (yaw ` +
+              `${yaw.toFixed(1)}, pitch ${pitch.toFixed(1)}); it is not reachable while keeping the ` +
+              `image upright, only by an "over the top" rotation that would swing the camera the ` +
+              `opposite way. Tilt toward the region first (e.g. obsbot_gimbal_move), then re-aim.`,
+          };
+        }
+
+        // required = m * min(frameW/width, frameH/height) / (1+margin). The MIN
+        // (not MAX) is deliberate: it's the axis that needs LESS extra zoom to fill,
+        // and zooming only that far keeps the OTHER axis from overflowing the frame
+        // — i.e. it's what keeps the whole region visible instead of cropping it.
+        // Note the frame's aspect ratio and VERTICAL_TANGENT_CORRECTION (src/geometry/aim.ts)
+        // do NOT appear here: writing out the fit condition on each axis, those terms
+        // scale tanH and tanV identically on both sides and cancel. They matter for
+        // AIMING at the region's centre (already folded into `aim` above via
+        // aimAtPixel) and not at all for how far to zoom.
+        const requiredRaw =
+          (magnification * Math.min(frameWidth / width, frameHeight / height)) / (1 + margin);
+        const requiredMagnification = clamp(requiredRaw, MIN_MAGNIFICATION, MAX_MAGNIFICATION);
+        const fitClamped = requiredMagnification !== requiredRaw;
+        const ratio = zoomRatioFromMagnification(requiredMagnification);
+
+        // Move BEFORE zoom. Zoom is centre-preserving but not target-preserving:
+        // zooming first can push the region's centre out of frame entirely, after
+        // which the move would be aiming at a pixel that no longer means what it
+        // did when it was measured.
+        await t.gimbalSet(aim.target.yaw, aim.target.pitch, 0);
+
+        const { min, max } = await t.zoomRange();
+        await t.zoomSet(zoomRatioToUnits(ratio, min, max));
+
+        // Zoom ramps rather than jumping, so a status read taken immediately after
+        // the write can catch it mid-transit — settled:false is a RESULT for the
+        // caller to check, not thrown as an error, since a slower-than-expected
+        // zoom is information, not a failure of this call.
+        const settled = await waitForZoomSettle(t, ratio, zoomSettle);
+
+        return {
+          ok: true,
+          target: aim.target,
+          ratio,
+          magnification: requiredMagnification,
+          clamped: fitClamped || aim.clamped,
+          settled,
+          source,
+          ...(source === "device" ? {} : { note: frameSourceNote(source) }),
+          ...(ready.reconnected ? { reconnected: true } : {}),
+        };
+      },
+    },
+    {
+      name: "obsbot_preset_list",
+      description:
+        "Read the three gimbal preset slots (occupied/empty, name, pose in degrees). " +
+        "Reads flat XU selectors 12 (list) and 13 (entry cursor), NOT the vendor V3 " +
+        "framed-reply path (which is non-functional for preset data on this device).",
+      schema: presetListSchema,
+      handler: async (args: unknown) => {
+        const { camera } = presetListSchema.parse(args);
+        const ready = await gate(camera);
+        if (!ready.ok) return ready;
+        const t = ready.transport;
+        try {
+          const slots = await readPresetSlots(t, () => gate(camera), presetRead);
+          return { ok: true, slots, ...(ready.reconnected && { reconnected: true }) };
+        } catch (e) {
+          return { ok: false, error: msg(e) };
+        }
+      },
+    },
+    {
+      name: "obsbot_preset_save",
+      description:
+        "Save the gimbal's current live pose (yaw/pitch, via the standard UVC Pan/Tilt " +
+        "controls) into preset slot 1|2|3. Slots are create-once on this device — there is " +
+        "no overwrite, so an occupied slot is rejected (delete it first). Verifies by " +
+        "re-reading the slot list after writing.",
+      schema: presetSaveSchema,
+      handler: async (args: unknown) => {
+        const { slot, camera } = presetSaveSchema.parse(args);
+        const ready = await gate(camera);
+        if (!ready.ok) return ready;
+        const t = ready.transport;
+        let pose: PresetPose;
+        try {
+          const before = await readPresetSlots(t, () => gate(camera), presetRead);
+          if (before[slot - 1].occupied) {
+            return { ok: false, error: `slot ${slot} is occupied; update or delete first` };
+          }
+          // Settled pose: a preset is a pose the user will RECALL later, so saving
+          // one sampled mid-slew bakes an arbitrary waypoint into the slot
+          // permanently. See readSteadyPose.
+          const { yaw, pitch } = await readSteadyPose(t);
+          // T6: ObsbotTransport exposes no zoom getter, so the live zoom ratio can't be
+          // read back here — zoom is hardcoded to 1 rather than guessed. Not an oversight.
+          pose = { pan: yaw, tilt: pitch, roll: 0, zoom: 1 };
+          await t.sendVendor(encodePresetAdd(t.nextSeq(), slot, pose));
+        } catch (e) {
+          return { ok: false, error: `preset save failed: ${msg(e)}` };
+        }
+        // M1: the ADD above has committed. From here on, a thrown error must say so —
+        // otherwise a retry hits "slot occupied" with no clue the save actually landed.
+        try {
+          const after = await readPresetSlots(t, () => gate(camera), presetRead);
+          if (!after[slot - 1].occupied) {
+            return { ok: false, error: "verification failed", expected: "occupied", actual: "empty" };
+          }
+          return { ok: true, slot: after[slot - 1], ...(ready.reconnected && { reconnected: true }) };
+        } catch (e) {
+          return {
+            ok: false,
+            error: `preset saved to slot ${slot} but verification failed: ${msg(e)}`,
+          };
+        }
+      },
+    },
+    {
+      name: "obsbot_preset_recall",
+      description:
+        "Recall preset slot 1|2|3, driving the gimbal to that slot's saved pose. The slot " +
+        "must be occupied. The gimbal may still be moving when this returns — verification " +
+        "only confirms the slot is still occupied, not that the pose has arrived.",
+      schema: presetRecallSchema,
+      handler: async (args: unknown) => {
+        const { slot, camera } = presetRecallSchema.parse(args);
+        const ready = await gate(camera);
+        if (!ready.ok) return ready;
+        const t = ready.transport;
+        try {
+          const before = await readPresetSlots(t, () => gate(camera), presetRead);
+          if (!before[slot - 1].occupied) {
+            return { ok: false, error: `slot ${slot} is empty; save first` };
+          }
+          await t.sendVendor(encodePresetRecall(t.nextSeq(), slot));
+          // Sync V4L2 pan/tilt register to the preset's saved pose. The vendor-frame
+          // recall physically moves the gimbal but corrupts V4L2 pan_absolute/tilt_absolute
+          // on Linux. Issuing gimbalSet (which uses V4L2 on Linux) to the known target
+          // both moves the gimbal there and restores the V4L2 register.
+          const recallPose = before[slot - 1].pose;
+          if (recallPose) {
+            await t.gimbalSet(recallPose.pan, recallPose.tilt);
+          }
+          const after = await readPresetSlots(t, () => gate(camera), presetRead);
+          if (!after[slot - 1].occupied) {
+            return { ok: false, error: "verification failed", expected: "occupied", actual: "empty" };
+          }
+          return { ok: true, slot: after[slot - 1], ...(ready.reconnected && { reconnected: true }) };
+        } catch (e) {
+          return { ok: false, error: msg(e) };
+        }
+      },
+    },
+    {
+      name: "obsbot_preset_update",
+      description:
+        "Overwrite preset slot 1|2|3 with the gimbal's current live pose (yaw/pitch via the " +
+        "standard UVC Pan/Tilt controls). The slot must already be occupied (save first to " +
+        "create it). Verifies by re-reading the slot list after writing.",
+      schema: presetUpdateSchema,
+      handler: async (args: unknown) => {
+        const { slot, camera } = presetUpdateSchema.parse(args);
+        const ready = await gate(camera);
+        if (!ready.ok) return ready;
+        const t = ready.transport;
+        let pose: PresetPose;
+        let previous: PresetPose | null = null;
+        try {
+          const before = await readPresetSlots(t, () => gate(camera), presetRead);
+          if (!before[slot - 1].occupied) {
+            return { ok: false, error: `slot ${slot} is empty; save first` };
+          }
+          // The pose we are about to destroy. Already in hand from the guard read, so
+          // handing it back costs nothing and is the only restore path the caller has:
+          // the device keeps no history and UPDATE is not reversible.
+          previous = before[slot - 1].pose;
+          // Mirror obsbot_preset_save's read path exactly, settled for the same
+          // reason: this pose is written into the slot, not reported.
+          const { yaw, pitch } = await readSteadyPose(t);
+          // T6: ObsbotTransport exposes no zoom getter, so the live zoom ratio can't be
+          // read back here — zoom is hardcoded to 1 rather than guessed. Not an oversight.
+          pose = { pan: yaw, tilt: pitch, roll: 0, zoom: 1 };
+          await t.sendVendor(encodePresetUpdate(t.nextSeq(), slot, pose));
+        } catch (e) {
+          return { ok: false, error: `preset update failed: ${msg(e)}` };
+        }
+        // M1: the UPDATE above has committed. From here on, a thrown error must say so.
+        try {
+          const after = await readPresetSlots(t, () => gate(camera), presetRead);
+          if (!after[slot - 1].occupied) {
+            return { ok: false, error: "verification failed", expected: "occupied", actual: "empty" };
+          }
+          return {
+            ok: true,
+            slot: after[slot - 1],
+            ...(previous && { previous }),
+            ...(ready.reconnected && { reconnected: true }),
+          };
+        } catch (e) {
+          return {
+            ok: false,
+            error: `preset updated in slot ${slot} but verification failed: ${msg(e)}`,
+          };
+        }
+      },
+    },
+    {
+      name: "obsbot_preset_rename",
+      description:
+        `Rename preset slot 1|2|3. The slot must already be occupied. Names longer than ` +
+        `${PRESET_NAME_MAX} bytes are truncated to fit the wire frame. Verifies by re-reading ` +
+        "the slot list after writing.",
+      schema: presetRenameSchema,
+      handler: async (args: unknown) => {
+        const { slot, name, camera } = presetRenameSchema.parse(args);
+        const ready = await gate(camera);
+        if (!ready.ok) return ready;
+        const t = ready.transport;
+        try {
+          const before = await readPresetSlots(t, () => gate(camera), presetRead);
+          if (!before[slot - 1].occupied) {
+            return { ok: false, error: `slot ${slot} is empty; save first` };
+          }
+          const clean = name.slice(0, PRESET_NAME_MAX);
+          // The read path (decodePresetEntry) base64-decodes the stored name, but the
+          // captured OBSBOT Center rename frame carried raw ASCII ("Preset1", "3reset2A"),
+          // so the write side sends raw ASCII here too — per the capture. Whether the
+          // device actually expects ASCII or base64 on the WRITE side is NOT yet
+          // hardware-confirmed; flagged for the hardware verification task.
+          await t.sendVendor(encodePresetSetName(t.nextSeq(), slot, clean));
+          const after = await readPresetSlots(t, () => gate(camera), presetRead);
+          if (after[slot - 1].name !== clean) {
+            return { ok: false, error: "verification failed", expected: clean, actual: after[slot - 1].name };
+          }
+          return { ok: true, slot: after[slot - 1], ...(ready.reconnected && { reconnected: true }) };
+        } catch (e) {
+          return { ok: false, error: msg(e) };
+        }
+      },
+    },
+    {
+      name: "obsbot_preset_delete",
+      description:
+        "Delete preset slot 1|2|3. The slot must be occupied. Verifies by re-reading the " +
+        "slot list after writing.",
+      schema: presetDeleteSchema,
+      handler: async (args: unknown) => {
+        const { slot, camera } = presetDeleteSchema.parse(args);
+        const ready = await gate(camera);
+        if (!ready.ok) return ready;
+        const t = ready.transport;
+        // Tracks whether the destructive write already left the host. If the
+        // post-write verify read throws, a bare error reads as "nothing happened"
+        // and invites a blind retry of an operation that already committed.
+        let sent = false;
+        try {
+          const before = await readPresetSlots(t, () => gate(camera), presetRead);
+          if (!before[slot - 1].occupied) {
+            return { ok: false, error: `slot ${slot} is already empty` };
+          }
+          // Everything the delete is about to destroy, captured from the guard read.
+          // Slots are create-once with no device-side history, so this response is the
+          // caller's ONLY route back if the wrong slot was named.
+          const destroyed = { name: before[slot - 1].name, pose: before[slot - 1].pose };
+          await t.sendVendor(encodePresetDelete(t.nextSeq(), slot));
+          sent = true;
+          const after = await readPresetSlots(t, () => gate(camera), presetRead);
+          if (after[slot - 1].occupied) {
+            return { ok: false, error: "verification failed", expected: "empty", actual: "occupied" };
+          }
+          return { ok: true, deleted: destroyed, ...(ready.reconnected && { reconnected: true }) };
+        } catch (e) {
+          if (sent) {
+            return {
+              ok: false,
+              error: `delete was sent and may have been applied, but verification failed: ${msg(e)}`,
+              committed: "unknown",
+            };
+          }
+          return { ok: false, error: msg(e) };
+        }
+      },
+    },
+    {
+      name: "obsbot_image_wb_auto",
+      description: "Enable auto white balance.",
+      schema: imageWbAutoSchema,
+      handler: async (args: unknown) => {
+        const { camera } = imageWbAutoSchema.parse(args);
+        const t = await getTransport(camera);
+        const { min } = await t.procAmpRange(VIDEO_PROCAMP_WHITE_BALANCE);
+        await t.procAmpSet(VIDEO_PROCAMP_WHITE_BALANCE, min, UVC_FLAG_AUTO);
+        return { ok: true, mode: "auto" };
+      },
+    },
+    {
+      name: "obsbot_image_wb_manual",
+      description:
+        "Set white balance to a colour temperature in Kelvin (clamped to the device's " +
+        "supported range).",
+      schema: imageWbManualSchema,
+      handler: async (args: unknown) => {
+        const { temperature, camera } = imageWbManualSchema.parse(args);
+        const t = await getTransport(camera);
+        const { min, max } = await t.procAmpRange(VIDEO_PROCAMP_WHITE_BALANCE);
+        const value = clamp(Math.round(temperature), min, max);
+        await t.procAmpSet(VIDEO_PROCAMP_WHITE_BALANCE, value, UVC_FLAG_MANUAL);
+        return { ok: true, mode: "manual", temperature: value };
+      },
+    },
+    {
+      name: "obsbot_image_adjust",
+      description:
+        "Adjust a standard image control: control is brightness | contrast | hue | " +
+        "saturation | sharpness | gain | backlight-compensation; level 0-100 is mapped onto " +
+        "the device's supported range for that control. Standard UVC (IAMVideoProcAmp), no auto. " +
+        "NOTE: `gain` and `backlight-compensation` are NOT implemented on the Tiny 2 — it " +
+        "reports them as zero-length controls — so they are refused with an error rather than " +
+        "silently doing nothing. The other five work.",
+      schema: imageControlSchema,
+      handler: async (args: unknown) => {
+        const { control, level, camera } = imageControlSchema.parse(args);
+        const property = IMAGE_CONTROL_PROP[control];
+        const t = await getTransport(camera);
+        const { min, max } = await t.procAmpRange(property);
+        const value = percentToRange(level, min, max);
+        await t.procAmpSet(property, value, UVC_FLAG_MANUAL);
+        return { ok: true, control, level, value };
+      },
+    },
+    {
+      name: "obsbot_image_exposure_auto",
+      description:
+        "Enable auto-exposure. Optional priority 'global' | 'face' selects the metering " +
+        "region (face-priority meters for a detected face). " +
+        "Uses the proprietary V3 frame protocol (CAM_SET_EXPOSURE_TINY2, which carries mode " +
+        "and value in one command) because the standard UVC/IAMCameraControl V4L2 path is a " +
+        "stub on the Tiny 2.",
+      schema: imageExposureAutoSchema,
+      handler: async (args: unknown) => {
+        const { priority, camera } = imageExposureAutoSchema.parse(args);
+        const t = await getTransport(camera);
+        // Mode and value go in ONE command — CAM_SET_EXPOSURE_TINY2 with a 5-byte
+        // [mode][value] payload. The separate CAM_SET_EXPOSURE_MODE command is inert
+        // on this device, and a 4-byte value payload is silently discarded.
+        // Device exposure range is 1..2500 (read from CAM_GET_EXPOSURE_RANGE_TINY2;
+        // the previous 0..65535 figure came from the Tiny4Linux reference and does
+        // not match this hardware). This branch carries no `level` input, so the
+        // value byte mirrors the combined tool's pre-split default (50%) — the
+        // device only acts on it once manual mode is selected.
+        const raw = percentToRange(50, 1, 2500);
+        await t.sendVendor(encodeSetExposure(false, raw).buildFrame(t.nextSeq()));
+        // Face vs global metering is a sel-6 uvcExt write applied after auto-exposure
+        // is on (readback surfaces at status offset 0x07). See encodeFaceAe.
+        if (priority) {
+          await t.xuRaw(UVC_XU_SELECTOR, encodeFaceAe(priority === "face"));
+          return { ok: true, mode: "auto", priority };
+        }
+        return { ok: true, mode: "auto" };
+      },
+    },
+    {
+      name: "obsbot_image_exposure_manual",
+      description:
+        "Set exposure level 0-100 (0 darkest → 100 brightest), mapped onto the device's " +
+        "exposure range. Also returns `raw`: the device-native exposure value the level mapped " +
+        "to, for diagnostics — `level` is the number to reason with. " +
+        "Uses the proprietary V3 frame protocol (CAM_SET_EXPOSURE_TINY2, which carries mode " +
+        "and value in one command) because the standard UVC/IAMCameraControl V4L2 path is a " +
+        "stub on the Tiny 2.",
+      schema: imageExposureManualSchema,
+      handler: async (args: unknown) => {
+        const { level, camera } = imageExposureManualSchema.parse(args);
+        const t = await getTransport(camera);
+        // Device exposure range is 1..2500 (read from CAM_GET_EXPOSURE_RANGE_TINY2;
+        // the previous 0..65535 figure came from the Tiny4Linux reference and does
+        // not match this hardware).
+        const raw = percentToRange(level, 1, 2500);
+        await t.sendVendor(encodeSetExposure(true, raw).buildFrame(t.nextSeq()));
+        return { ok: true, mode: "manual", level, raw };
+      },
+    },
+    {
+      name: "obsbot_capture_snapshot",
+      description:
+        "Grab one still frame from the camera and return it as an image (for you to see " +
+        "and for framing/lighting/exposure checks). resolution is the longest edge in pixels, " +
+        "256-1920, default 640 — larger images cost proportionally more tokens, so ask for " +
+        "more only when you need the detail. NOTE: before calling, ensure the camera " +
+        "is focused (call obsbot_focus_auto for autofocus) unless otherwise " +
+        "directed. source: device (default) | virtual | ndi. " +
+        "If the camera is in use by another app, returns a message instead of an image.",
+      schema: snapshotSchema,
+      handler: async (args: unknown) => {
+        const { resolution, quality, settleMs, source, camera } = snapshotSchema.parse(args);
+        const t = await getTransport(camera);
+        let path: string | undefined;
+        if (source !== "device") {
+          const devices = await mgr.list();
+          const re = source === "virtual" ? /OBSBOT Virtual Camera/i : /NDI Webcam/i;
+          const match = devices.find((d) => re.test(d.name));
+          if (!match) {
+            return {
+              content: [
+                {
+                  type: "text",
+                  text: `No '${source}' video source found (is OBSBOT Center / NDI running?).`,
+                },
+              ],
+            };
+          }
+          path = match.path;
+        }
+        try {
+          // The helper's wire field is still maxDim (shared with the Windows and
+          // Linux helpers); `resolution` is the tool-facing name.
+          const snap = await t.snapshot({ path, maxDim: resolution, quality, settleMs });
+          return {
+            content: [
+              { type: "image", data: snap.base64, mimeType: snap.mime },
+              {
+                type: "text",
+                text: JSON.stringify({
+                  width: snap.width,
+                  height: snap.height,
+                  source,
+                  // Frame rate picks the field of view on this camera, so the
+                  // negotiated format is part of what a pixel means. Reported
+                  // when the platform helper knows it; see Snapshot.sourceFormat.
+                  ...(snap.sourceFormat ? { sourceFormat: snap.sourceFormat } : {}),
+                }),
+              },
+            ],
+          };
+        } catch (e) {
+          if (e instanceof CameraBusyError) {
+            return {
+              content: [
+                {
+                  type: "text",
+                  text:
+                    "Camera is in use by another application. Close it (or try source:'virtual' " +
+                    "or 'ndi' if OBSBOT Center is running), then retry.",
+                },
+              ],
+            };
+          }
+          throw e;
+        }
+      },
+    },
+    {
+      name: "obsbot_capture_record",
+      description:
+        "Start recording the camera to an MP4 (for the user). durationSec optional (open-ended " +
+        "recordings auto-stop after 60 min); audio defaults to on (the OBSBOT mic); outputPath " +
+        "optional (defaults to ~/Videos/OBSBOT on every platform, including macOS, where that " +
+        "is NOT the usual ~/Movies). NOTE: before calling, ensure the camera " +
+        "is focused (call obsbot_focus_auto for autofocus) unless otherwise " +
+        "directed. source: device|virtual|ndi. Returns a sessionId " +
+        "for obsbot_capture_stop.",
+      schema: recordStartSchema,
+      handler: async (args: unknown) => {
+        const parsed = recordStartSchema.parse(args);
+        try {
+          const s = await needCapture().startRecord({
+            source: parsed.source, durationSec: parsed.durationSec,
+            audio: parsed.audio, outputPath: parsed.outputPath,
+          });
+          return { ok: true, sessionId: s.id, outputPath: s.outputPath, durationSec: s.durationSec };
+        } catch (e) {
+          return captureErrorText(e);
+        }
+      },
+    },
+    {
+      name: "obsbot_capture_preview",
+      description:
+        "Open a live preview window of the camera (for the user to watch). NOTE: before calling, " +
+        "ensure the camera is focused (call obsbot_focus_auto for autofocus) unless " +
+        "otherwise directed. source: device|virtual|ndi. " +
+        "Returns a sessionId for obsbot_capture_stop.",
+      schema: previewStartSchema,
+      handler: async (args: unknown) => {
+        const { source } = previewStartSchema.parse(args);
+        try {
+          const s = await needCapture().startPreview({ source });
+          return { ok: true, sessionId: s.id };
+        } catch (e) {
+          return captureErrorText(e);
+        }
+      },
+    },
+    {
+      name: "obsbot_capture_stop",
+      description:
+        "Stop a recording or preview session by its sessionId. Recordings are stopped gracefully so " +
+        "the MP4 finalizes correctly.",
+      schema: captureStopSchema,
+      handler: async (args: unknown) => {
+        const { sessionId } = captureStopSchema.parse(args);
+        try {
+          const r = await needCapture().stop(sessionId);
+          return { ok: true, ...r };
+        } catch (e) {
+          return captureErrorText(e);
+        }
+      },
+    },
+    {
+      name: "obsbot_capture_list",
+      description: "List active recording/preview sessions (id, kind, source, output path, start time).",
+      schema: captureListSchema,
+      handler: async (args: unknown) => {
+        captureListSchema.parse(args);
+        return { sessions: needCapture().list() };
+      },
+    },
+  ];
+
+  // obsbot_debug_probe is an RE/diagnostics-only tool (raw XU byte access); expose it
+  // only under --debug so normal deployments don't advertise it. get_status's raw
+  // block is gated the same way, inside its handler.
+  const filtered = debug ? toolDefs : toolDefs.filter((t) => t.name !== "obsbot_debug_probe");
+
+  // obsbot_gimbal_move_speed is hidden on Linux specifically: without live position
+  // feedback there (see LinuxTransport's class comment), a speed×duration burst can't
+  // be verified to stay within the gimbal's mechanical range before it gets there —
+  // unlike an absolute target, which is clamped up front regardless of current
+  // position. obsbot_gimbal_move/obsbot_gimbal_recenter remain fully available.
+  return process.platform === "linux"
+    ? filtered.filter((t) => t.name !== "obsbot_gimbal_move_speed")
+    : filtered;
+}

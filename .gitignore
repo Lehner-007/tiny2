@@ -1,0 +1,46 @@
+# Node
+node_modules/
+dist/
+*.tsbuildinfo
+
+# Native build artifacts (the build dir; the prebuilt helper is handled separately)
+native/**/build/
+native/**/build-*/
+native/prebuilt/
+
+# macOS: compiled helper + diagnostic binaries. The sources next to them are
+# tracked; these are build output that happens to live in the source dir.
+native/macos/obsbot-helper
+native/macos/diag_helper
+native/macos/debug_uvc
+native/macos/test_avf_uvc
+
+# macOS: retired CoreMediaIO extension experiment. Superseded by direct
+# device-level UVC control in helper.m; kept out of the repo (310MB of Xcode
+# build artifacts around a handful of dead sources).
+native/macos/cmio-ext/
+
+# OS cruft
+.DS_Store
+Thumbs.db
+
+# Editors
+.idea/
+.vscode/
+tools/
+
+# Logs
+logs/
+
+# Integration-test run reports (timestamped run output, not source)
+artifacts/
+
+# Vendor bug-report drafts (contain device serial; not for the public repo)
+obsbot-firmware-bug-report.md
+
+# Desktop runtime and local development
+.config/
+work/
+__pycache__/
+*.pyc
+recordings/

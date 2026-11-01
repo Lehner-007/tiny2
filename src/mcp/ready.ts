@@ -1,0 +1,108 @@
+import { decodeStatus } from "../codec/commands.js";
+import { encodeSetRunStatus } from "../codec/commands.js";
+import { ObsbotTransport } from "../transport/transport.js";
+
+/**
+ * The minimal slice of connection-lifecycle control the readiness gate needs to
+ * self-heal a mid-session disconnect: drop the dead transport so a re-resolve
+ * rebinds, and report (once, clearing on read) whether that re-resolve was a
+ * reconnect. Satisfied by DeviceManager (via a thin adapter in server.ts); the
+ * two methods are exactly what the retired DeviceSession exposed, so ensureReady
+ * changes only the type it depends on, not its body.
+ */
+export interface ReconnectCtl {
+  invalidate(): Promise<void>;
+  takeReconnected(): boolean;
+}
+
+export type ReadyResult =
+  | { ok: true; transport: ObsbotTransport; reconnected: boolean; woke: boolean }
+  | { ok: false; reason: "unreachable" | "wake-timeout"; error: string };
+
+export interface ReadyOpts {
+  pollMs?: number;
+  wakeTimeoutMs?: number;
+  settleMs?: number;
+}
+
+const DEFAULTS: Required<ReadyOpts> = { pollMs: 200, wakeTimeoutMs: 2500, settleMs: 300 };
+
+const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
+// Exported for reuse by any caller catch block that needs a safe error string —
+// `(e as Error).message` yields "undefined" on a non-Error throw (e.g. a string
+// or plain object thrown by a mock/dependency).
+export const msg = (e: unknown): string => (e instanceof Error ? e.message : String(e));
+
+const readAwake = async (t: ObsbotTransport): Promise<boolean> =>
+  decodeStatus(await t.recvStatus()).awake;
+
+/**
+ * Gate a gimbal/AI command on device readiness. A single status read is a 3-way
+ * probe: it throws when the device is unreachable, and otherwise reports awake.
+ *
+ *  - unreachable  → invalidate + one re-open (if a session is given); still
+ *                   unreachable → { ok:false, reason:"unreachable" }.
+ *  - asleep       → send wake, poll `awake` up to wakeTimeoutMs, settle; never
+ *                   wakes → { ok:false, reason:"wake-timeout" }.
+ *  - awake        → { ok:true, transport, reconnected }.
+ *
+ * The command is only sent by the caller after ok:true — a gate failure never
+ * touches the gimbal. Without a reconnect controller, self-heal is skipped but
+ * awake-gating still applies.
+ */
+export async function ensureReady(
+  getTransport: () => Promise<ObsbotTransport>,
+  reconnect?: ReconnectCtl,
+  opts: ReadyOpts = {},
+): Promise<ReadyResult> {
+  const { pollMs, wakeTimeoutMs, settleMs } = { ...DEFAULTS, ...opts };
+
+  let t: ObsbotTransport;
+  try {
+    t = await getTransport();
+  } catch (e) {
+    return { ok: false, reason: "unreachable", error: `camera not found: ${msg(e)}` };
+  }
+
+  let awake: boolean;
+  try {
+    awake = await readAwake(t);
+  } catch (e) {
+    // Probe failed — device likely unplugged. Self-heal once if we can.
+    if (!reconnect) {
+      return { ok: false, reason: "unreachable", error: `camera not reachable: ${msg(e)}` };
+    }
+    await reconnect.invalidate();
+    try {
+      t = await getTransport();
+      awake = await readAwake(t);
+    } catch (e2) {
+      return { ok: false, reason: "unreachable", error: `camera not reachable: ${msg(e2)}` };
+    }
+  }
+
+  let woke = false;
+  if (!awake) {
+    woke = true;
+    await t.sendVendor(encodeSetRunStatus("run").buildFrame(t.nextSeq()));
+    let waited = 0;
+    while (waited < wakeTimeoutMs) {
+      await sleep(pollMs);
+      waited += pollMs;
+      try {
+        if (await readAwake(t)) {
+          awake = true;
+          break;
+        }
+      } catch {
+        // transient read during wake — keep polling until the deadline
+      }
+    }
+    if (!awake) {
+      return { ok: false, reason: "wake-timeout", error: "camera did not wake within timeout" };
+    }
+    await sleep(settleMs); // let the gimbal finish rising before we drive it
+  }
+
+  return { ok: true, transport: t, reconnected: reconnect?.takeReconnected() ?? false, woke };
+}

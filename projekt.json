@@ -1,0 +1,75 @@
+{
+  "program_id": "obsbot",
+  "name": "Tiny",
+  "authors": [
+    "Josef – Desktop-Anwendung",
+    "Michael Jordan – obsbot-mcp"
+  ],
+  "license": "MIT",
+  "image": "assets/tiny.png",
+  "watermark": "assets/report_watermark.png",
+  "update_url": "",
+  "source_url": "",
+  "profiles_enabled": false,
+  "demo_enabled": false,
+  "settings": [
+    {
+      "key": "preview_width",
+      "type": "number",
+      "default": 1280,
+      "min": 640,
+      "max": 1920,
+      "label": "preview_width"
+    },
+    {
+      "key": "preview_fps",
+      "type": "number",
+      "default": 30,
+      "min": 5,
+      "max": 60,
+      "label": "preview_fps"
+    },
+    {
+      "key": "status_seconds",
+      "type": "number",
+      "default": 5,
+      "min": 2,
+      "max": 60,
+      "label": "status_seconds"
+    },
+    {
+      "key": "mirror_horizontal",
+      "type": "boolean",
+      "default": false,
+      "label": "mirror_horizontal",
+      "settings_visible": false
+    },
+    {
+      "key": "audio_enabled",
+      "type": "boolean",
+      "default": true,
+      "label": "audio_enabled"
+    },
+    {
+      "key": "image_directory",
+      "type": "string",
+      "default": "~/Bilder",
+      "label": "image_directory"
+    },
+    {
+      "key": "audio_directory",
+      "type": "string",
+      "default": "~/Musik",
+      "label": "audio_directory"
+    },
+    {
+      "key": "image_quality",
+      "type": "number",
+      "default": 95,
+      "min": 1,
+      "max": 100,
+      "label": "image_quality"
+    }
+  ],
+  "tool_info": []
+}
