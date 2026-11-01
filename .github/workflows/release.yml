@@ -31,8 +31,6 @@ jobs:
       - run: npm audit --audit-level=low
       - run: npm run build
       - run: npm test
-      - name: Test desktop application
-        run: python3 test/desktop/run_isolated.py
       - name: Build native Linux helper
         run: |
           sudo apt-get install -y cmake build-essential libjpeg-dev desktop-file-utils
@@ -40,6 +38,8 @@ jobs:
           cmake --build work/native-build --parallel
           mkdir -p native/prebuilt/linux-x64
           install -m 0755 work/native-build/obsbot-helper native/prebuilt/linux-x64/obsbot-helper
+      - name: Test desktop application
+        run: python3 test/desktop/run_isolated.py
       - name: Build and verify Debian package
         env:
           TINY_DEB_OUTPUT_DIR: ${{ runner.temp }}/release
