@@ -22,7 +22,7 @@ jobs:
       - name: Install desktop test dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y python3-gi gir1.2-gtk-4.0 gir1.2-gstreamer-1.0 gir1.2-gst-plugins-base-1.0 python3-gst-1.0 gstreamer1.0-plugins-base ffmpeg
+          sudo apt-get install -y python3-gi gir1.2-gtk-4.0 gir1.2-gstreamer-1.0 gir1.2-gst-plugins-base-1.0 python3-gst-1.0 gstreamer1.0-plugins-base ffmpeg xvfb
       - name: Check release version
         run: |
           test "${GITHUB_REF_NAME#v}" = "$(cat VERSION)"
@@ -39,7 +39,7 @@ jobs:
           mkdir -p native/prebuilt/linux-x64
           install -m 0755 work/native-build/obsbot-helper native/prebuilt/linux-x64/obsbot-helper
       - name: Test desktop application
-        run: python3 test/desktop/run_isolated.py
+        run: xvfb-run -a python3 test/desktop/run_isolated.py
       - name: Build and verify Debian package
         env:
           TINY_DEB_OUTPUT_DIR: ${{ runner.temp }}/release
