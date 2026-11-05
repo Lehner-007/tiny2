@@ -633,3 +633,7 @@ with a preview running. The error text suggests `source: "virtual"` or `"ndi"` a
 and safe for *aiming* only if the feed is an unmodified pass-through of the camera — declare it with
 the `source` parameter on `obsbot_aim_at_pixel` / `obsbot_zoom_to_fit` and read the `note` it returns.
 A compositor that rescales or letterboxes the frame silently invalidates the geometry.
+
+## Oberflächensprachen
+
+Zehn Sprachen mit lokaler Hilfe sind enthalten. Die acht Zusatzsprachen sind maschinell übersetzt; Details und Prüfhinweise stehen in [TRANSLATIONS.md](TRANSLATIONS.md).

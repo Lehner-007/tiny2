@@ -40,7 +40,8 @@ class Strings:
                 if isinstance(name, str) and name.strip(): return name
             except (OSError, ValueError, AttributeError):
                 pass
-        return fallback or code
+        bundled_names = {'ar': 'العربية', 'es': 'Español', 'fr': 'Français', 'hi': 'हिन्दी', 'pt': 'Português', 'ru': 'Русский', 'tr': 'Türkçe', 'zh': '中文'}
+        return bundled_names.get(code, fallback or code)
 
     def help_path(self):
         paths = [config_dir()/'languages'/self.code/'help.html',ROOT/'help'/self.code/'index.html',resource_dir()/'help'/self.code/'index.html', resource_dir()/'help/en/index.html']
@@ -49,6 +50,7 @@ class Strings:
     @staticmethod
     def languages():
         codes = {'de','en'}
+        codes.update(p.stem for p in (ROOT/'lang').glob('*.json') if re.fullmatch(r'[a-z]{2,3}(?:[-_][A-Za-z0-9]{2,8})?', p.stem))
         base = config_dir()/'languages'
         if base.exists():
             codes.update(p.parent.name for p in base.glob('*/strings.json') if re.fullmatch(r'[a-z]{2,3}(?:[-_][A-Za-z0-9]{2,8})?',p.parent.name))
